@@ -1,3 +1,4 @@
+from aiter.ops.triton.quant.dual_layout_mxfp4 import dual_layout_quant_mxfp4
 from aiter.ops.triton.quant.fast_transpose import fast_transpose_2d
 from aiter.ops.triton.quant.fused_fp8_quant import (
     calc_rows_per_block,
@@ -55,6 +56,7 @@ __all__ = [
     # fast_transpose.py exports
     "convert_from_mxfp8",
     "convert_to_mxfp8",
+    "dual_layout_quant_mxfp4",
     "dynamic_mxfp4_quant",
     "dynamic_mxfp8_quant",
     "dynamic_mxfp8_quant_n32k4_mbn",
