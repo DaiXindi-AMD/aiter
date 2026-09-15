@@ -21,6 +21,7 @@ from aiter.ops.triton.quant.fused_mxfp8_quant import (
     fused_flatten_mxfp8_quant,
     fused_rms_mxfp8_quant,
 )
+from aiter.ops.triton.quant.mxfp4 import dequant_hadamard_quant_mxfp4
 from aiter.ops.triton.quant.quant import (
     _mxfp4_quant_op,
     _mxfp8_quant_op,
@@ -63,6 +64,7 @@ __all__ = [
     "dynamic_nvfp4_quant",
     "dynamic_per_tensor_quant_fp8_i8",
     "dynamic_per_token_quant_fp8_i8",
+    "dequant_hadamard_quant_mxfp4",
     "fast_transpose_2d",
     "fp8_legacy_to_mxfp8",
     "fused_dual_rmsnorm_mxfp8_quant",
