@@ -1,13 +1,10 @@
+from .quant.quant import _mxfp4_quant_op
+from .quant.fused_fp8_quant import _fp8_quant_op
 import triton
 import triton.language as tl
 
-from aiter.ops.triton._triton_kernels.quant.fused_fp8_quant import _fp8_quant_op
-from aiter.ops.triton._triton_kernels.quant.quant import _mxfp4_quant_op
-
-
-@triton.jit
-def _silu_exp2(x):
-    return x / (1.0 + tl.exp2(-(x * 1.44269504089)))
+from aiter.ops.triton.utils._triton.activation import _silu_exp2
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
 
 @triton.jit
@@ -15,32 +12,32 @@ def _silu(x):
     return _silu_exp2(x)
 
 
-@triton.jit
-def _sigmoid_exp2(x):
-    return 1.0 / (1.0 + tl.exp2(-(x * 1.44269504089)))
+_fused_silu_mul_kernel_repr = make_kernel_repr(
+    "fused_silu_mul_kernel",
+    ["BLOCK_M", "BLOCK_N", "EAGER_ROUNDING"],
+)
 
 
-@triton.jit
-def _sigmoid(x):
-    return _sigmoid_exp2(x)
-
-
-@triton.jit
+@triton.jit(repr=_fused_silu_mul_kernel_repr)
 def fused_silu_mul_kernel(
-    inp_ptr,
+    gate_ptr,
+    up_ptr,
     out_ptr,
     n_rows,
     n_cols,
-    row_stride_in,
-    col_stride_in,
+    row_stride_gate,
+    col_stride_gate,
+    row_stride_up,
+    col_stride_up,
     row_stride_out,
     col_stride_out,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    EAGER_ROUNDING: tl.constexpr,
 ):
     """
-    SiLU on the first half of the last dimension, multiply by the second half.
-    Each row has 2 * n_cols input elements; writes n_cols outputs.
+    Apply SiLU to ``gate`` and multiply by ``up`` for matching 2D tiles.
+    Each input row has ``n_cols`` elements and the output has the same shape.
     2D grid: axis 0 tiles rows (BLOCK_M), axis 1 tiles columns (BLOCK_N).
     """
     m_pid = tl.program_id(0)
@@ -50,19 +47,38 @@ def fused_silu_mul_kernel(
     row_idx = m_pid * BLOCK_M + m_offs
     col_idx = n_pid * BLOCK_N + n_offs
 
-    row_in = row_idx * row_stride_in
-    row_out = row_idx * row_stride_out
+    row_idx_i64 = row_idx.to(tl.int64)
+    col_idx_i64 = col_idx.to(tl.int64)
+    row_stride_gate_i64 = tl.cast(row_stride_gate, tl.int64)
+    col_stride_gate_i64 = tl.cast(col_stride_gate, tl.int64)
+    row_stride_up_i64 = tl.cast(row_stride_up, tl.int64)
+    col_stride_up_i64 = tl.cast(col_stride_up, tl.int64)
+    row_stride_out_i64 = tl.cast(row_stride_out, tl.int64)
+    col_stride_out_i64 = tl.cast(col_stride_out, tl.int64)
 
-    first_half_ptrs = inp_ptr + row_in[:, None] + col_idx[None, :] * col_stride_in
-    second_half_ptrs = (
-        inp_ptr + row_in[:, None] + (n_cols + col_idx)[None, :] * col_stride_in
+    gate_ptrs = (
+        gate_ptr
+        + row_idx_i64[:, None] * row_stride_gate_i64
+        + col_idx_i64[None, :] * col_stride_gate_i64
     )
-    out_ptrs = out_ptr + row_out[:, None] + col_idx[None, :] * col_stride_out
+    up_ptrs = (
+        up_ptr
+        + row_idx_i64[:, None] * row_stride_up_i64
+        + col_idx_i64[None, :] * col_stride_up_i64
+    )
+    out_ptrs = (
+        out_ptr
+        + row_idx_i64[:, None] * row_stride_out_i64
+        + col_idx_i64[None, :] * col_stride_out_i64
+    )
 
     mask = (row_idx < n_rows)[:, None] & (col_idx < n_cols)[None, :]
-    a = tl.load(first_half_ptrs, mask=mask, other=0.0).to(tl.float32)
-    silu_a = _silu_exp2(a).to(inp_ptr.dtype.element_ty)
-    b = tl.load(second_half_ptrs, mask=mask, other=0.0)
+    a = tl.load(gate_ptrs, mask=mask, other=0.0).to(tl.float32)
+    if EAGER_ROUNDING:
+        silu_a = _silu_exp2(a).to(gate_ptr.dtype.element_ty)
+    else:
+        silu_a = a * tl.sigmoid(a)
+    b = tl.load(up_ptrs, mask=mask, other=0.0).to(tl.float32)
     o = (silu_a * b).to(out_ptr.dtype.element_ty)
     tl.store(out_ptrs, o, mask=mask)
 
@@ -104,8 +120,6 @@ def _get_activation_from_str(activation: str):
     mapping = {
         "gelu": _gelu,
         "gelu_tanh": _gelu_tanh,
-        "sigmoid": _sigmoid,
-        "sigmoid_exp2": _sigmoid_exp2,
         "silu": _silu,
         "silu_exp2": _silu_exp2,
         "relu": _relu,
@@ -120,10 +134,6 @@ def _apply_activation_from_str(x, activation: tl.constexpr):
         return _gelu(x)
     elif activation == "gelu_tanh":
         return _gelu_tanh(x)
-    elif activation == "sigmoid":
-        return _sigmoid(x)
-    elif activation == "sigmoid_exp2":
-        return _sigmoid_exp2(x)
     elif activation == "silu":
         return _silu(x)
     elif activation == "silu_exp2":
@@ -138,8 +148,10 @@ def _apply_activation_from_str(x, activation: tl.constexpr):
 
 @triton.heuristics(
     {
-        "EVEN_M_N": lambda args: args["M"] % args["BLOCK_SIZE_M"] == 0
-        and args["N"] % (args["BLOCK_SIZE_N"] * args["NUM_ITER"]) == 0,
+        "EVEN_M_N": lambda args: (
+            args["M"] % args["BLOCK_SIZE_M"] == 0
+            and args["N"] % (args["BLOCK_SIZE_N"] * args["NUM_ITER"]) == 0
+        ),
     }
 )
 @triton.jit
@@ -250,7 +262,6 @@ def _act_mul_and_dynamic_mxfp4_quant_kernel(
         if EVEN_M_N:
             tl.store(bs_ptr + bs_offs, bs_e8m0)
         else:
-
             tl.store(
                 bs_ptr + bs_offs,
                 bs_e8m0,
@@ -340,3 +351,102 @@ def _act_mul_and_dynamic_fp8_group_quant_kernel(
             x_bs.to(x_bs_ptr.dtype.element_ty),
             mask=bs_mask,
         )
+
+
+# ── Fused SwiGLU forward / backward ─────────────────────────────────────
+
+_swiglu_bwd_kernel_repr = make_kernel_repr(
+    "swiglu_bwd_kernel",
+    ["BLOCK_M", "BLOCK_N", "EAGER_ROUNDING"],
+)
+
+
+@triton.jit(repr=_swiglu_bwd_kernel_repr)
+def _swiglu_bwd_kernel(
+    grad_ptr,
+    gate_ptr,
+    up_ptr,
+    dgate_ptr,
+    dup_ptr,
+    n_rows,
+    n_cols,
+    row_stride_grad,
+    col_stride_grad,
+    row_stride_gate,
+    col_stride_gate,
+    row_stride_up,
+    col_stride_up,
+    row_stride_dgate,
+    col_stride_dgate,
+    row_stride_dup,
+    col_stride_dup,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    EAGER_ROUNDING: tl.constexpr,
+):
+    """Compute SwiGLU gradients from separate gate/up tensors in 2D tiles."""
+    m_pid = tl.program_id(0)
+    n_pid = tl.program_id(1)
+    row_idx = m_pid * BLOCK_M + tl.arange(0, BLOCK_M)
+    col_idx = n_pid * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask = (row_idx < n_rows)[:, None] & (col_idx < n_cols)[None, :]
+
+    row_idx_i64 = row_idx.to(tl.int64)
+    col_idx_i64 = col_idx.to(tl.int64)
+    row_stride_grad_i64 = tl.cast(row_stride_grad, tl.int64)
+    col_stride_grad_i64 = tl.cast(col_stride_grad, tl.int64)
+    row_stride_gate_i64 = tl.cast(row_stride_gate, tl.int64)
+    col_stride_gate_i64 = tl.cast(col_stride_gate, tl.int64)
+    row_stride_up_i64 = tl.cast(row_stride_up, tl.int64)
+    col_stride_up_i64 = tl.cast(col_stride_up, tl.int64)
+    row_stride_dgate_i64 = tl.cast(row_stride_dgate, tl.int64)
+    col_stride_dgate_i64 = tl.cast(col_stride_dgate, tl.int64)
+    row_stride_dup_i64 = tl.cast(row_stride_dup, tl.int64)
+    col_stride_dup_i64 = tl.cast(col_stride_dup, tl.int64)
+
+    grad_ptrs = (
+        grad_ptr
+        + row_idx_i64[:, None] * row_stride_grad_i64
+        + col_idx_i64[None, :] * col_stride_grad_i64
+    )
+    gate_ptrs = (
+        gate_ptr
+        + row_idx_i64[:, None] * row_stride_gate_i64
+        + col_idx_i64[None, :] * col_stride_gate_i64
+    )
+    up_ptrs = (
+        up_ptr
+        + row_idx_i64[:, None] * row_stride_up_i64
+        + col_idx_i64[None, :] * col_stride_up_i64
+    )
+    dgate_ptrs = (
+        dgate_ptr
+        + row_idx_i64[:, None] * row_stride_dgate_i64
+        + col_idx_i64[None, :] * col_stride_dgate_i64
+    )
+    dup_ptrs = (
+        dup_ptr
+        + row_idx_i64[:, None] * row_stride_dup_i64
+        + col_idx_i64[None, :] * col_stride_dup_i64
+    )
+
+    grad = tl.load(grad_ptrs, mask=mask, other=0.0).to(tl.float32)
+    gate = tl.load(gate_ptrs, mask=mask, other=0.0).to(tl.float32)
+    up = tl.load(up_ptrs, mask=mask, other=0.0).to(tl.float32)
+
+    if EAGER_ROUNDING:
+        sigmoid = 1.0 / (1.0 + tl.exp2(-(gate * 1.44269504089)))
+    else:
+        sigmoid = tl.sigmoid(gate)
+    silu = gate * sigmoid
+    dsilu = sigmoid * (1.0 + gate * (1.0 - sigmoid))
+
+    if EAGER_ROUNDING:
+        silu = silu.to(gate_ptr.dtype.element_ty).to(tl.float32)
+        grad_silu = (grad * up).to(grad_ptr.dtype.element_ty).to(tl.float32)
+        dgate = grad_silu * dsilu
+    else:
+        dgate = grad * dsilu * up
+
+    tl.store(dgate_ptrs, dgate, mask=mask)
+    tl.store(dup_ptrs, grad * silu, mask=mask)
