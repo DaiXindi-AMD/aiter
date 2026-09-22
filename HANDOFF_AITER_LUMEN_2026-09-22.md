@@ -2,6 +2,40 @@
 
 Date: 2026-09-22
 
+## Remote recovery refs
+
+These are backup refs, not PR branches. Do not open PRs directly from them.
+
+| Repository | Remote branch | Snapshot commit | Purpose |
+| --- | --- | --- | --- |
+| `DaiXindi-AMD/aiter` | `backup/2026-09-22/pending-aiter-kernels` | updated by the handoff-doc commit | Combined source for scale shuffle, RMSNorm, FP8 fix, and original MXFP4 migration work |
+| `DaiXindi-AMD/aiter` | `backup/2026-09-22/fused-swiglu-dual-layout-wip` | `35e796da188e2131d004e5b17391b7b8e836d852` | Newer uncommitted fused SwiGLU/dual-layout and two-input quant prototype |
+| `DaiXindi-AMD/Lumen` | `backup/2026-09-22/aiter-kernel-integration` | `dae77b2404df505fa00fb377330681ec4b50d054` | Lumen integration prototype and #5542 integration plan |
+
+The clean operator refs are also present on `DaiXindi-AMD/aiter`:
+
+- `dai/mxfp4-dual-layout` at `ddd226fbacacd2117c59debe72d68cffba85d9da`.
+- `dai/mxfp4-dequant-h16-requant-v2` at `de0b691ca79533b4ae7118e6a253ccd96268dbb0`.
+
+Example recovery on a new machine:
+
+```bash
+git clone https://github.com/DaiXindi-AMD/aiter.git
+cd aiter
+git fetch origin backup/2026-09-22/pending-aiter-kernels
+git fetch origin backup/2026-09-22/fused-swiglu-dual-layout-wip
+git fetch origin dai/mxfp4-dual-layout
+git fetch origin dai/mxfp4-dequant-h16-requant-v2
+```
+
+For Lumen:
+
+```bash
+git clone https://github.com/DaiXindi-AMD/Lumen.git
+cd Lumen
+git fetch origin backup/2026-09-22/aiter-kernel-integration
+```
+
 ## Current upstream status
 
 - ROCm/aiter #5531 — merged: gfx950 stochastic MXFP4 quantization.
