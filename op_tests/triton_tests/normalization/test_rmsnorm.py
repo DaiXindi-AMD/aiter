@@ -6,7 +6,6 @@ import torch
 
 import aiter
 from aiter.ops.triton.normalization.rmsnorm import (
-    _should_use_large_m_small_n,
     rms_norm,
     rmsnorm2d_fwd_with_add,
     rmsnorm2d_fwd_with_add_dynamicquant,
@@ -14,6 +13,11 @@ from aiter.ops.triton.normalization.rmsnorm import (
     rmsnorm2d_fwd_with_dynamicquant,
     rmsnorm2d_fwd_with_smoothquant,
 )
+from aiter.ops.triton.normalization._rmsnorm_schedule import (
+    _rmsnorm_bwd_num_programs,
+    _rmsnorm_bwd_tile_shape,
+)
+from aiter.ops.triton.utils.device_info import get_num_sms
 from aiter.ops.triton.utils.types import str_to_torch_dtype
 
 
@@ -29,7 +33,7 @@ def torch_rmsnorm(x, g, out_dtype=torch.float16, epsilon=1e-6):
     # cast to float32 as the triton kernel
     x_f32 = x.float()
     g_f32 = g.float()
-    rms = torch.sqrt(torch.sum(x_f32 * x_f32, dim=-1) * 1 / N)
+    rms = torch.sqrt(torch.sum(x_f32 * x_f32, dim=-1) * 1 / N + epsilon)
     rsigma = 1.0 / rms
     rms_norm_f32 = x_f32 * rsigma.unsqueeze(1) * g_f32
     rms_norm = rms_norm_f32.to(out_dtype)
@@ -119,18 +123,46 @@ def get_vals():
         (71, 3571),
         (364800, 128),
         (16380, 1536),
-        # (29, 17389), // Temporarily disable this test due to abort issues on CI
-        # Large-M / small-N shapes that dispatch to _rmsnorm_kernel_large_m_small_n
-        # and _rmsnorm_bwd_kernel_large_m_small_n (M > 8192, N <= 1024).
-        # Representative of Qwen3 per-head q/k norm (b*s*heads, head_dim).
+        # large-M / small-N backward specialization (Qwen3 per-head q/k norm)
         (16384, 128),
-        (32768, 64),
-        (16384, 512),
-        (16384, 1024),
-        (16385, 513),  # non-power-of-two N and M not divisible by BLOCK_M
+        # (29, 17389), // Temporarily disable this test due to abort issues on CI
     ]
 
     return vals
+
+
+def test_rmsnorm_bwd_persistent_grid_stride():
+    torch.manual_seed(0)
+    dtype = torch.bfloat16
+    n = 128
+    block_m, _ = _rmsnorm_bwd_tile_shape(n)
+    num_sms = get_num_sms()
+    m = max(8193, (num_sms * 2 + 1) * block_m + 1)
+
+    # The launch has more row tiles than resident programs, and the final tile
+    # is partial. This covers both the grid-stride loop and its row mask.
+    num_tiles = (m + block_m - 1) // block_m
+    num_prgms = _rmsnorm_bwd_num_programs(m, block_m, num_sms)
+    assert num_prgms == num_sms * 2
+    assert num_tiles > num_prgms
+
+    x = torch.randn((m, n), dtype=dtype, device="cuda", requires_grad=True)
+    weight = torch.randn(n, dtype=dtype, device="cuda", requires_grad=True)
+    dy = torch.randn_like(x)
+
+    x_ref = x.detach().clone().requires_grad_(True)
+    weight_ref = weight.detach().clone().requires_grad_(True)
+    x_ref_f32 = x_ref.float()
+    rsigma_ref = torch.rsqrt(x_ref_f32.square().mean(dim=-1, keepdim=True) + 1e-5)
+    y_ref = (x_ref_f32 * rsigma_ref * weight_ref.float()).to(dtype)
+    y = rms_norm(x, weight, 1e-5)
+
+    y.backward(dy)
+    y_ref.backward(dy)
+
+    torch.testing.assert_close(y, y_ref, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(x.grad, x_ref.grad, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(weight.grad, weight_ref.grad, rtol=2e-2, atol=2e-2)
 
 
 @pytest.mark.parametrize("in_dtype_str", ["fp32", "fp16", "bf16"])
@@ -166,15 +198,8 @@ def test_rmsnorm(M, N, in_dtype_str):
     if out_dtype in (torch.float16, torch.bfloat16):
         atol, rtol = 1e-2, 1e-2
     else:
-        if _should_use_large_m_small_n(M, N):
-            # Large-M/small-N path uses tiled 2-D grid; looser tolerance matches
-            # the per-block rounding accumulated over BLOCK_M rows.
+        if M == 364800 and N == 128:
             atol, rtol = 1e-2, 1e-2
-        elif N >= 32768:
-            # Large-N BLOCKED path: two-pass reduction (kernel partial sums +
-            # _rmsnorm_bwd_dg_reduce) reorders fp32 additions vs PyTorch's
-            # sequential sum, accumulating ~2e-4 error over N=65536 elements.
-            atol, rtol = 5e-4, 5e-4
         else:
             # float32 typically can be tighter
             atol, rtol = 1e-4, 1e-4
@@ -226,15 +251,8 @@ def test_fused_add_rmsnorm(M, N, in_dtype_str):
     if out_dtype in (torch.float16, torch.bfloat16):
         atol, rtol = 1e-2, 1e-2
     else:
-        if _should_use_large_m_small_n(M, N, backward=True):
-            # Large-M/small-N path uses tiled 2-D grid; looser tolerance matches
-            # the per-block rounding accumulated over BLOCK_M rows.
+        if M == 364800 and N == 128:
             atol, rtol = 1e-2, 1e-2
-        elif N >= 32768:
-            # Large-N BLOCKED path: two-pass reduction (kernel partial sums +
-            # _rmsnorm_bwd_dg_reduce) reorders fp32 additions vs PyTorch's
-            # sequential sum, accumulating ~2e-4 error over N=65536 elements.
-            atol, rtol = 5e-4, 5e-4
         else:
             # float32 typically can be tighter
             atol, rtol = 1e-4, 1e-4

@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from aiter.ops.triton.activation import fused_silu_mul
+from aiter.ops.triton.activation import fused_silu_mul, swiglu_bwd, swiglu_fwd
 
 LOG2_E = 1.44269504089
 
@@ -26,6 +26,26 @@ def torch_silu_mul_last_dim_ref(x: torch.Tensor) -> torch.Tensor:
     d = x.size(-1) // 2
     a, b = x[..., :d], x[..., d:]
     return (silu_exp2_ref(a) * b).to(x.dtype)
+
+
+def torch_swiglu_ref(x: torch.Tensor) -> torch.Tensor:
+    d = x.size(-1) // 2
+    gate, up = x[..., :d].float(), x[..., d:].float()
+    return (gate * torch.sigmoid(gate) * up).to(x.dtype)
+
+
+def torch_swiglu_backward_ref(
+    grad_output: torch.Tensor, x: torch.Tensor
+) -> torch.Tensor:
+    d = x.size(-1) // 2
+    gate, up = x[..., :d].float(), x[..., d:].float()
+    grad = grad_output.float()
+    sigmoid_gate = torch.sigmoid(gate)
+    silu_gate = gate * sigmoid_gate
+    dsilu_gate = sigmoid_gate * (1.0 + gate * (1.0 - sigmoid_gate))
+    return torch.cat((grad * up * dsilu_gate, grad * silu_gate), dim=-1).to(
+        x.dtype
+    )
 
 
 @pytest.mark.parametrize(
@@ -60,6 +80,55 @@ def test_fused_silu_mul_requires_even_last_dim():
     x = torch.randn(2, 3, device="cuda")
     with pytest.raises(AssertionError, match="even"):
         fused_silu_mul(x)
+
+
+@pytest.mark.parametrize(
+    "shape",
+    [
+        (4, 64),
+        (128, 256),
+        (31, 500),
+        (2, 16, 128),
+        (1, 3, 7, 32),
+    ],
+)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("noncontiguous_grad", [False, True])
+def test_standard_swiglu_forward_backward(shape, dtype, noncontiguous_grad):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    torch.manual_seed(0)
+    x = torch.randn(shape, dtype=dtype, device="cuda")
+    grad_shape = (*shape[:-1], shape[-1] // 2)
+    if noncontiguous_grad:
+        grad_storage = torch.randn(
+            *shape[:-1], shape[-1], dtype=dtype, device="cuda"
+        )
+        grad_output = grad_storage[..., ::2]
+        assert grad_output.shape == grad_shape
+        assert not grad_output.is_contiguous()
+    else:
+        grad_output = torch.randn(grad_shape, dtype=dtype, device="cuda")
+
+    out_ref = torch_swiglu_ref(x)
+    grad_ref = torch_swiglu_backward_ref(grad_output, x)
+    out = swiglu_fwd(x)
+    grad = swiglu_bwd(grad_output, x)
+    torch.testing.assert_close(out, out_ref, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(grad, grad_ref, rtol=1e-2, atol=1e-2)
+
+
+def test_silu_mul_apis_reject_empty_last_dim():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    x = torch.empty((2, 0), device="cuda")
+    grad_output = torch.empty_like(x)
+    with pytest.raises(AssertionError, match="non-zero"):
+        fused_silu_mul(x)
+    with pytest.raises(AssertionError, match="non-zero"):
+        swiglu_fwd(x)
+    with pytest.raises(AssertionError, match="non-zero"):
+        swiglu_bwd(grad_output, x)
 
 
 @pytest.mark.parametrize(

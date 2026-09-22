@@ -14,10 +14,14 @@ from aiter.ops.triton._triton_kernels.normalization.rmsnorm import (
     _rmsnorm_bwd_triton,
     _rmsnorm_kernel_large_m_small_n,
 )
-from aiter.ops.triton.utils._triton.arch_info import get_arch
+from aiter.ops.triton.normalization._rmsnorm_schedule import (
+    _rmsnorm_bwd_schedule,
+    _rmsnorm_bwd_tile_shape,
+    _should_use_persistent_narrow_bwd,
+    _should_use_tiled_forward,
+)
 from aiter.ops.triton.utils.device_info import get_num_sms
 from aiter.ops.triton.utils.logger import AiterTritonLogger
-from aiter.ops.triton.utils.normalization_config_utils import get_normalization_config
 from aiter.ops.triton.utils.types import get_dtype_max
 
 _LOGGER = AiterTritonLogger()
@@ -115,14 +119,17 @@ def _rmsnorm_backward(dz, x, gamma, rsigma):
 
     M, N = x_.shape
 
-    if _should_use_large_m_small_n(M, N, backward=True):
-        # Row-parallel tiling for large-M / small-N (q/k per-head norm). Avoids
-        # the generic kernel's get_num_sms()-capped grid that serializes rows.
-        BLOCK_N = triton.next_power_of_2(N)
-        BLOCK_M = max(min(16384 // BLOCK_N, 32), 8)
-        num_prgms = triton.cdiv(M, BLOCK_M)
+    persistent = _should_use_persistent_narrow_bwd(M, N)
+    schedule = _rmsnorm_bwd_schedule(
+        M, N, get_num_sms() if persistent else None
+    )
+    if schedule is not None:
+        # The existing tiled kernel also covers the narrow training shapes
+        # migrated from Lumen.  For N <= 512, cap the grid and let each program
+        # stride over row tiles; wider pre-existing shapes retain their full
+        # grid until they have been benchmarked with the persistent schedule.
+        BLOCK_M, BLOCK_N, num_prgms = schedule
         dg_tmp = torch.empty(num_prgms, N, device=x_.device, dtype=torch.float32)
-        _cfg = get_normalization_config("rmsnorm_large_m_small_n", get_arch())
         _rmsnorm_bwd_kernel_large_m_small_n[(num_prgms,)](
             dz_,
             x_,
@@ -134,14 +141,13 @@ def _rmsnorm_backward(dz, x, gamma, rsigma):
             dz_.stride(0),
             M,
             N,
+            num_prgms,
             BLOCK_M=BLOCK_M,
             BLOCK_N=BLOCK_N,
-            NUM_WARPS=_cfg["num_warps"],
-            NUM_STAGES=_cfg["num_stages"],
-            num_warps=_cfg["num_warps"],
-            num_stages=_cfg["num_stages"],
+            num_warps=8,
+            num_stages=2,
         )
-        grid_reduce = lambda meta: [triton.cdiv(N, meta["BLOCK_SIZE_N"])]
+        grid_reduce = lambda meta: (triton.cdiv(N, meta["BLOCK_SIZE_N"]),)
         _rmsnorm_bwd_dg_reduce_triton[grid_reduce](
             dg_tmp,
             dgamma,
@@ -189,7 +195,7 @@ def _rmsnorm_backward(dz, x, gamma, rsigma):
     )
 
     if need_reduction:
-        grid_reduce = lambda meta: [triton.cdiv(N, meta["BLOCK_SIZE_N"])]
+        grid_reduce = lambda meta: (triton.cdiv(N, meta["BLOCK_SIZE_N"]),)
         _rmsnorm_bwd_dg_reduce_triton[grid_reduce](
             dg_tmp,
             dgamma,
@@ -203,31 +209,13 @@ def _rmsnorm_backward(dz, x, gamma, rsigma):
     return dx, dgamma
 
 
-def _should_use_large_m_small_n(M: int, N: int, backward: bool = False) -> bool:
-    """Return True when the large-M/small-N tiled kernel should be used.
-
-    Forward and backward have different crossover points: the backward kernel
-    produces ceil(M/BLOCK_M) partial dgamma rows that must be reduced, so its
-    net benefit shrinks as N grows.  Benchmarks on MI308X (M=16384, bf16):
-
-      N=128  → fwd 13.6×, bwd 5.1×   N=512  → fwd 7.8×, bwd 3.0×
-      N=1024 → fwd 5.0×,  bwd 1.2×   N=1280 → fwd 2.6×, bwd ~1×
-
-    Forward benefit persists to N≈2048; backward benefit drops below noise at
-    N>1024, so separate thresholds avoid a regression for larger N.
-    """
-    if not (M > 8192):
-        return False
-    return N <= 1024 if backward else N <= 2048
-
-
 def rmsnorm_forward_inference(x: torch.Tensor, weight: torch.Tensor, eps: float):
     assert x.ndim == 2 and weight.ndim == 1 and x.shape[1] == weight.shape[0]
     x = x.contiguous()
     weight = weight.contiguous()
     M, N = x.shape
 
-    if _should_use_large_m_small_n(M, N):
+    if _should_use_tiled_forward(M, N, is_training=False):
         return _rmsnorm_forward_large_m_small_n(x, weight, eps, return_rsigma=False)
     else:
         y, _ = _rmsnorm_forward(
@@ -245,9 +233,14 @@ class _RMSNorm(torch.autograd.Function):
             tensor.requires_grad for tensor in [x, weight]
         )
         M, N = x.shape
-        if _should_use_large_m_small_n(M, N):
+        use_training_narrow = is_grad and _should_use_persistent_narrow_bwd(M, N)
+        if _should_use_tiled_forward(M, N, is_training=is_grad):
             out = _rmsnorm_forward_large_m_small_n(
-                x, weight, epsilon, return_rsigma=is_grad
+                x,
+                weight,
+                epsilon,
+                return_rsigma=is_grad,
+                use_narrow_tile=use_training_narrow,
             )
             if is_grad:
                 y, rsigma = out
@@ -623,6 +616,7 @@ def _rmsnorm_forward_large_m_small_n(
     weight: torch.Tensor,
     eps: float,
     return_rsigma: bool = False,
+    use_narrow_tile: bool = False,
 ):
     assert x.ndim == 2 and weight.ndim == 1 and x.shape[1] == weight.shape[0]
     x, weight = x.contiguous(), weight.contiguous()
@@ -633,10 +627,13 @@ def _rmsnorm_forward_large_m_small_n(
     )
 
     BLOCK_N = triton.next_power_of_2(N)
-    BLOCK_M = min(16384 // BLOCK_N, 32)
-    BLOCK_M = max(BLOCK_M, 8)
+    if use_narrow_tile:
+        # Preserve Lumen's training schedule: short rows use a wider M tile to
+        # fill the wavefront without launching four times as many programs.
+        BLOCK_M, BLOCK_N = _rmsnorm_bwd_tile_shape(N)
+    else:
+        BLOCK_M = max(min(16384 // BLOCK_N, 32), 8)
 
-    _cfg = get_normalization_config("rmsnorm_large_m_small_n", get_arch())
     grid = (triton.cdiv(M, BLOCK_M),)
     _rmsnorm_kernel_large_m_small_n[grid](
         x,
@@ -652,9 +649,7 @@ def _rmsnorm_forward_large_m_small_n(
         y.stride(1),
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
-        NUM_WARPS=_cfg["num_warps"],
-        NUM_STAGES=_cfg["num_stages"],
-        num_warps=_cfg["num_warps"],
-        num_stages=_cfg["num_stages"],
+        num_warps=8,
+        num_stages=2,
     )
     return (y, rsigma) if return_rsigma else y

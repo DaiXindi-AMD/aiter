@@ -1,8 +1,10 @@
 import triton
 import triton.language as tl
 
-from aiter.ops.triton._triton_kernels.quant.fused_fp8_quant import _fp8_quant_op
-from aiter.ops.triton._triton_kernels.quant.quant import _mxfp4_quant_op
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+
+from .quant.fused_fp8_quant import _fp8_quant_op
+from .quant.quant import _mxfp4_quant_op
 
 
 @triton.jit
@@ -15,14 +17,176 @@ def _silu(x):
     return _silu_exp2(x)
 
 
-@triton.jit
-def _sigmoid_exp2(x):
-    return 1.0 / (1.0 + tl.exp2(-(x * 1.44269504089)))
+_glu_fwd_kernel_repr = make_kernel_repr(
+    "_glu_fwd_kernel",
+    ["I", "BLOCK_M", "BLOCK_I", "CONCAT_LAYOUT", "ACT_TYPE"],
+)
 
 
-@triton.jit
-def _sigmoid(x):
-    return _sigmoid_exp2(x)
+@triton.jit(repr=_glu_fwd_kernel_repr)
+def _glu_fwd_kernel(
+    h_ptr,
+    a_ptr,
+    TK,
+    I: tl.constexpr,
+    stride_h_m,
+    stride_h_i,
+    stride_a_m,
+    stride_a_i,
+    BLOCK_M: tl.constexpr,
+    BLOCK_I: tl.constexpr,
+    CONCAT_LAYOUT: tl.constexpr,
+    ACT_TYPE: tl.constexpr,
+):
+    """Shared GLU-family forward kernel for concat or interleaved inputs."""
+    pid_m = tl.program_id(0)
+    pid_i = tl.program_id(1)
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_i = pid_i * BLOCK_I + tl.arange(0, BLOCK_I)
+    m_mask = offs_m < TK
+    i_mask = offs_i < I
+
+    if CONCAT_LAYOUT:
+        gate_offs = offs_i
+        up_offs = offs_i + I
+    else:
+        gate_offs = offs_i * 2
+        up_offs = offs_i * 2 + 1
+
+    gate = tl.load(
+        h_ptr
+        + offs_m[:, None].to(tl.int64) * stride_h_m
+        + gate_offs[None, :].to(tl.int64) * stride_h_i,
+        mask=m_mask[:, None] & i_mask[None, :],
+        other=0.0,
+    ).to(tl.float32)
+    up = tl.load(
+        h_ptr
+        + offs_m[:, None].to(tl.int64) * stride_h_m
+        + up_offs[None, :].to(tl.int64) * stride_h_i,
+        mask=m_mask[:, None] & i_mask[None, :],
+        other=0.0,
+    ).to(tl.float32)
+
+    if ACT_TYPE == 0:  # swiglu
+        act_gate = gate * tl.sigmoid(gate)
+    elif ACT_TYPE == 1:  # geglu (tanh approximation)
+        SQRT_2_OVER_PI: tl.constexpr = 0.7978845608028654
+        COEFF: tl.constexpr = 0.044715
+        inner = SQRT_2_OVER_PI * (gate + COEFF * gate * gate * gate)
+        act_gate = 0.5 * gate * (1.0 + tl.extra.hip.libdevice.tanh(inner))
+    elif ACT_TYPE == 2:  # reglu
+        act_gate = tl.where(gate > 0, gate, 0.0)
+
+    out = act_gate * up
+
+    tl.store(
+        a_ptr
+        + offs_m[:, None].to(tl.int64) * stride_a_m
+        + offs_i[None, :].to(tl.int64) * stride_a_i,
+        out.to(a_ptr.dtype.element_ty),
+        mask=m_mask[:, None] & i_mask[None, :],
+    )
+
+
+_glu_bwd_kernel_repr = make_kernel_repr(
+    "_glu_bwd_kernel",
+    ["I", "BLOCK_M", "BLOCK_I", "CONCAT_LAYOUT", "ACT_TYPE"],
+)
+
+
+@triton.jit(repr=_glu_bwd_kernel_repr)
+def _glu_bwd_kernel(
+    h_ptr,
+    dh_ptr,
+    da_ptr,
+    TK,
+    I: tl.constexpr,
+    stride_h_m,
+    stride_h_i,
+    stride_dh_m,
+    stride_dh_i,
+    stride_da_m,
+    stride_da_i,
+    BLOCK_M: tl.constexpr,
+    BLOCK_I: tl.constexpr,
+    CONCAT_LAYOUT: tl.constexpr,
+    ACT_TYPE: tl.constexpr,
+):
+    """Shared GLU-family backward kernel for concat or interleaved inputs."""
+    pid_m = tl.program_id(0)
+    pid_i = tl.program_id(1)
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_i = pid_i * BLOCK_I + tl.arange(0, BLOCK_I)
+    m_mask = offs_m < TK
+    i_mask = offs_i < I
+
+    if CONCAT_LAYOUT:
+        gate_offs = offs_i
+        up_offs = offs_i + I
+    else:
+        gate_offs = offs_i * 2
+        up_offs = offs_i * 2 + 1
+
+    gate = tl.load(
+        h_ptr
+        + offs_m[:, None].to(tl.int64) * stride_h_m
+        + gate_offs[None, :].to(tl.int64) * stride_h_i,
+        mask=m_mask[:, None] & i_mask[None, :],
+        other=0.0,
+    ).to(tl.float32)
+    up = tl.load(
+        h_ptr
+        + offs_m[:, None].to(tl.int64) * stride_h_m
+        + up_offs[None, :].to(tl.int64) * stride_h_i,
+        mask=m_mask[:, None] & i_mask[None, :],
+        other=0.0,
+    ).to(tl.float32)
+    da = tl.load(
+        da_ptr
+        + offs_m[:, None].to(tl.int64) * stride_da_m
+        + offs_i[None, :].to(tl.int64) * stride_da_i,
+        mask=m_mask[:, None] & i_mask[None, :],
+        other=0.0,
+    ).to(tl.float32)
+
+    if ACT_TYPE == 0:  # swiglu
+        sig = tl.sigmoid(gate)
+        act_gate = gate * sig
+        d_up = da * act_gate
+        d_gate = da * up * sig * (1.0 + gate * (1.0 - sig))
+    elif ACT_TYPE == 1:  # geglu (tanh approximation)
+        SQRT_2_OVER_PI: tl.constexpr = 0.7978845608028654
+        COEFF: tl.constexpr = 0.044715
+        inner = SQRT_2_OVER_PI * (gate + COEFF * gate * gate * gate)
+        tanh_val = tl.extra.hip.libdevice.tanh(inner)
+        act_gate = 0.5 * gate * (1.0 + tanh_val)
+        d_up = da * act_gate
+        dtanh = 1.0 - tanh_val * tanh_val
+        dinner = SQRT_2_OVER_PI * (1.0 + 3.0 * COEFF * gate * gate)
+        d_gate = da * up * (
+            0.5 * (1.0 + tanh_val) + 0.5 * gate * dtanh * dinner
+        )
+    elif ACT_TYPE == 2:  # reglu
+        relu_mask = gate > 0
+        act_gate = tl.where(relu_mask, gate, 0.0)
+        d_up = da * act_gate
+        d_gate = da * up * tl.where(relu_mask, 1.0, 0.0)
+
+    tl.store(
+        dh_ptr
+        + offs_m[:, None].to(tl.int64) * stride_dh_m
+        + gate_offs[None, :].to(tl.int64) * stride_dh_i,
+        d_gate.to(dh_ptr.dtype.element_ty),
+        mask=m_mask[:, None] & i_mask[None, :],
+    )
+    tl.store(
+        dh_ptr
+        + offs_m[:, None].to(tl.int64) * stride_dh_m
+        + up_offs[None, :].to(tl.int64) * stride_dh_i,
+        d_up.to(dh_ptr.dtype.element_ty),
+        mask=m_mask[:, None] & i_mask[None, :],
+    )
 
 
 @triton.jit
@@ -104,8 +268,6 @@ def _get_activation_from_str(activation: str):
     mapping = {
         "gelu": _gelu,
         "gelu_tanh": _gelu_tanh,
-        "sigmoid": _sigmoid,
-        "sigmoid_exp2": _sigmoid_exp2,
         "silu": _silu,
         "silu_exp2": _silu_exp2,
         "relu": _relu,
@@ -120,10 +282,6 @@ def _apply_activation_from_str(x, activation: tl.constexpr):
         return _gelu(x)
     elif activation == "gelu_tanh":
         return _gelu_tanh(x)
-    elif activation == "sigmoid":
-        return _sigmoid(x)
-    elif activation == "sigmoid_exp2":
-        return _sigmoid_exp2(x)
     elif activation == "silu":
         return _silu(x)
     elif activation == "silu_exp2":

@@ -1,7 +1,25 @@
 import torch
+import triton
 
-from aiter.ops.shuffle import shuffle_weight as _shuffle_weight_base
-from aiter.ops.triton.utils._triton.arch_info import get_arch
+from aiter.ops.triton._triton_kernels.quant.mxfp4_layout import (
+    MXFP4_SCALE_KCHUNK,
+    MXFP4_SCALE_STRIPE,
+    _swizzle_expanded_2d_scale_kernel,
+    _swizzle_mxfp4_scale_gfx950_kernel,
+)
+
+
+def _resolve_arch(arch):
+    """Resolve the current GPU architecture only when the caller needs it."""
+    if arch is not None:
+        return arch
+
+    # Importing arch_info probes the active Triton/JAX GPU backend. Keep that
+    # probe out of the module import path so explicit-arch CPU references work
+    # on build and test hosts without an accelerator.
+    from aiter.ops.triton.utils._triton.arch_info import get_arch
+
+    return get_arch()
 
 # =============================================================================
 # WEIGHTS
@@ -52,14 +70,16 @@ def shuffle_weight(
     On gfx1250 the WMMA TDM layout (``_shuffle_weight_gfx1250``) is used; on every
     other arch this delegates to the base ``aiter.ops.shuffle.shuffle_weight``.
     """
-    if (arch or get_arch()) == "gfx1250":
+    if _resolve_arch(arch) == "gfx1250":
         if use_int4 or is_guinterleave or gate_up or pad_k_to:
             raise NotImplementedError(
                 "shuffle_weight on gfx1250 does not support use_int4 / is_guinterleave / gate_up / pad_k_to "
             )
         return _shuffle_weight_gfx1250(x)
 
-    return _shuffle_weight_base(
+    from aiter.ops.shuffle import shuffle_weight as shuffle_weight_base
+
+    return shuffle_weight_base(
         x,
         layout=layout,
         use_int4=use_int4,
@@ -141,17 +161,120 @@ def shuffle_scale_gemm(
     gfx950: preshuffle_factor = 32, scale_kwidth = 8
     gfx1250: preshuffle_factor = 16, scale_kwidth = 4
     """
-    if (arch or get_arch()) == "gfx1250":
+    arch = _resolve_arch(arch)
+    if arch == "gfx1250":
         return _shuffle_scale_tile_gfx1250(scales, preshuffle_factor, scale_kwidth)
 
-    if (arch or get_arch()) == "gfx950":
+    if arch == "gfx950":
+        if (
+            scales.device.type == "cuda"
+            and scales.dim() == 2
+            and scales.is_contiguous()
+            and preshuffle_factor == MXFP4_SCALE_STRIPE
+            and scale_kwidth == MXFP4_SCALE_KCHUNK
+        ):
+            rows, cols = scales.shape
+            if rows % preshuffle_factor or cols % scale_kwidth:
+                raise ValueError(
+                    f"scale shape ({rows}, {cols}) must be divisible by "
+                    f"({preshuffle_factor}, {scale_kwidth})"
+                )
+            out = torch.empty(
+                (rows // preshuffle_factor, cols * preshuffle_factor),
+                dtype=scales.dtype,
+                device=scales.device,
+            )
+            num_kchunks = cols // scale_kwidth
+            block_k = min(8, triton.next_power_of_2(num_kchunks))
+            grid = (rows // preshuffle_factor, triton.cdiv(num_kchunks, block_k))
+            _swizzle_mxfp4_scale_gfx950_kernel[grid](
+                scales,
+                out,
+                cols,
+                scales.stride(0),
+                STRIPE=preshuffle_factor,
+                KCHUNK=scale_kwidth,
+                BLOCK_K=block_k,
+            )
+            return out
         return _shuffle_scale_tile_gfx950(scales, preshuffle_factor, scale_kwidth)
-    raise ValueError(f"Unsupported arch: {arch or get_arch()}")
+    raise ValueError(f"Unsupported arch: {arch}")
+
+
+def shuffle_scale_gemm_expanded(
+    scales: torch.Tensor,
+    block_size: int = 32,
+    transpose: bool = False,
+    arch=None,
+    preshuffle_factor: int = 16,
+    scale_kwidth: int = 4,
+) -> torch.Tensor:
+    """Expand a 2-D scale grid by block rows and emit GEMM scale layout.
+
+    The gfx950 ``32 x 8`` case uses a fused Triton expand-and-shuffle kernel
+    for contiguous GPU inputs. Other inputs use the canonical tensor-layout
+    reference, which also makes explicit-architecture CPU tests possible.
+    """
+    if scales.dim() != 2:
+        raise ValueError(f"expected 2-D scales, got {scales.dim()}-D")
+    if block_size <= 0:
+        raise ValueError(f"block_size must be positive, got {block_size}")
+
+    arch = _resolve_arch(arch)
+    tile_rows, tile_cols = scales.shape
+    if transpose:
+        tile_rows, tile_cols = tile_cols, tile_rows
+    rows, cols = tile_rows * block_size, tile_cols
+    if rows % preshuffle_factor or cols % scale_kwidth:
+        raise ValueError(
+            f"expanded scale shape ({rows}, {cols}) must be divisible by "
+            f"({preshuffle_factor}, {scale_kwidth})"
+        )
+
+    if (
+        arch == "gfx950"
+        and scales.device.type == "cuda"
+        and scales.is_contiguous()
+        and preshuffle_factor == MXFP4_SCALE_STRIPE
+        and scale_kwidth == MXFP4_SCALE_KCHUNK
+    ):
+        out = torch.empty(
+            (rows // preshuffle_factor, cols * preshuffle_factor),
+            dtype=scales.dtype,
+            device=scales.device,
+        )
+        num_kchunks = cols // scale_kwidth
+        block_k = min(8, triton.next_power_of_2(num_kchunks))
+        grid = (rows // preshuffle_factor, triton.cdiv(num_kchunks, block_k))
+        stride_tile_row, stride_tile_col = scales.stride()
+        if transpose:
+            stride_tile_row, stride_tile_col = stride_tile_col, stride_tile_row
+        _swizzle_expanded_2d_scale_kernel[grid](
+            scales,
+            out,
+            cols,
+            stride_tile_row,
+            stride_tile_col,
+            QUANT_BLOCK_SIZE=block_size,
+            STRIPE=preshuffle_factor,
+            KCHUNK=scale_kwidth,
+            BLOCK_K=block_k,
+        )
+        return out
+
+    grid = scales.transpose(0, 1) if transpose else scales
+    expanded = grid.repeat_interleave(block_size, dim=0).contiguous()
+    return shuffle_scale_gemm(
+        expanded,
+        arch=arch,
+        preshuffle_factor=preshuffle_factor,
+        scale_kwidth=scale_kwidth,
+    )
 
 
 def unshuffle_scale_gemm(scales_shuffled: torch.Tensor, arch=None) -> torch.Tensor:
     """Inverse of ``shuffle_scale_gemm`` (gfx950 layout). gfx1250 has no consumer."""
-    if (arch or get_arch()) == "gfx1250":
+    if _resolve_arch(arch) == "gfx1250":
         raise NotImplementedError("unshuffle_scale_gemm is not implemented for gfx1250")
     scales = scales_shuffled.clone()
     sm, sn = scales.shape
@@ -185,7 +308,7 @@ def shuffle_scale_moe(
     ``layout=None``, so callers can invoke this unconditionally without an
     arch check of their own.
     """
-    arch = arch or get_arch()
+    arch = _resolve_arch(arch)
     if arch == "gfx1250":
         tiled = _shuffle_scale_tile_gfx1250(
             data.transpose(-1, -2), preshuffle_factor, scale_kwidth

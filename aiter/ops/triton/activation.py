@@ -7,11 +7,11 @@ import aiter
 from aiter.ops.triton._triton_kernels.activation import (
     _act_mul_and_dynamic_fp8_group_quant_kernel,
     _act_mul_and_dynamic_mxfp4_quant_kernel,
+    _glu_bwd_kernel,
+    _glu_fwd_kernel,
     fused_silu_mul_kernel,
 )
 from aiter.ops.triton.utils.logger import AiterTritonLogger
-
-fp8_dtype = aiter.dtypes.fp8
 
 _LOGGER = AiterTritonLogger()
 
@@ -134,7 +134,7 @@ def act_mul_and_fp8_group_quant(
     x: torch.Tensor,
     activation: Literal["silu", "gelu", "gelu_tanh"],
     group_size,
-    dtype_quant=fp8_dtype,
+    dtype_quant=None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Apply the activation function and quantize the result to MX FP4 format.
@@ -157,6 +157,9 @@ def act_mul_and_fp8_group_quant(
     Returns:
         A tuple of (x_fp4, blockscale_e8m0).
     """
+    if dtype_quant is None:
+        dtype_quant = aiter.dtypes.fp8
+
     _LOGGER.info(f"ACT_MUL_FP8_GROUP_QUANT: x={tuple(x.shape)} activation={activation}")
     # Assume x is 2D-Tensor for now
     M, N = x.shape
@@ -209,9 +212,10 @@ def fused_silu_mul(
     """
     Fused SiLU-and-mul along the last dimension (same pattern as MoE silu-fused GEMM).
 
-    ``x`` must be contiguous with even ``size(-1)``. For last size ``2 * d``, the first
-    ``d`` lanes are passed through SiLU (``_silu_exp2``); the second ``d`` lanes are the
-    multipliers. Output shape matches ``x`` except ``out.size(-1) == d``.
+    ``x`` must be contiguous with positive, even ``size(-1)``. For last size
+    ``2 * d``, the first ``d`` lanes are passed through SiLU (``_silu_exp2``);
+    the second ``d`` lanes are the multipliers. Output shape matches ``x``
+    except ``out.size(-1) == d``.
 
     Returns:
         ``out`` if provided, else a newly allocated tensor.
@@ -262,6 +266,7 @@ def fused_silu_mul(
     assert x.is_cuda, "fused_silu_mul requires a CUDA tensor"
     assert x.is_contiguous(), "x must be contiguous"
     last = x.size(-1)
+    assert last > 0, "last dimension must be non-zero"
     assert last % 2 == 0, "last dimension must be even (2 * d)"
     d = last // 2
     leading = x.shape[:-1]
@@ -309,3 +314,102 @@ def fused_silu_mul(
         waves_per_eu=0,
     )
     return out
+
+
+def _swiglu_launch_shape(rows: int, half_cols: int) -> tuple[tuple[int, int], int, int]:
+    block_m = 32
+    block_i = min(triton.next_power_of_2(half_cols), 1024)
+    return (
+        (triton.cdiv(rows, block_m), triton.cdiv(half_cols, block_i)),
+        block_m,
+        block_i,
+    )
+
+
+def swiglu_fwd(y: torch.Tensor) -> torch.Tensor:
+    """Compute standard ``silu(gate) * up`` for a concatenated input.
+
+    The last dimension must be positive and even.
+
+    Unlike :func:`fused_silu_mul`, this API preserves the training semantics
+    used by Lumen and SonicMoE: SiLU and the multiply are evaluated in FP32
+    before the result is cast back to the input dtype. Explicit row and column
+    strides support views; ``reshape`` materializes only when a 2D view is not
+    possible.
+    """
+    assert y.is_cuda, "swiglu_fwd requires a CUDA tensor"
+    last = y.size(-1)
+    assert last > 0, "last dimension must be non-zero"
+    assert last % 2 == 0, "last dimension must be even (2 * d)"
+    half_cols = last // 2
+    flat_y = y.reshape(-1, last)
+    rows = flat_y.shape[0]
+    out = torch.empty((rows, half_cols), dtype=y.dtype, device=y.device)
+    if rows == 0:
+        return out.reshape(*y.shape[:-1], half_cols)
+
+    grid, block_m, block_i = _swiglu_launch_shape(rows, half_cols)
+    _glu_fwd_kernel[grid](
+        flat_y,
+        out,
+        rows,
+        half_cols,
+        flat_y.stride(0),
+        flat_y.stride(1),
+        out.stride(0),
+        out.stride(1),
+        BLOCK_M=block_m,
+        BLOCK_I=block_i,
+        CONCAT_LAYOUT=True,
+        ACT_TYPE=0,
+    )
+    return out.reshape(*y.shape[:-1], half_cols)
+
+
+def swiglu_bwd(grad_output: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """Return the input gradient of :func:`swiglu_fwd`.
+
+    The last dimension of ``y`` must be positive and even.
+
+    Explicit row and column strides support non-contiguous incoming autograd
+    gradients; ``reshape`` materializes only when a 2D view is not possible.
+    """
+    assert y.is_cuda and grad_output.is_cuda, "swiglu_bwd requires CUDA tensors"
+    last = y.size(-1)
+    assert last > 0, "last dimension must be non-zero"
+    assert last % 2 == 0, "last dimension must be even (2 * d)"
+    half_cols = last // 2
+    expected_shape = (*y.shape[:-1], half_cols)
+    assert grad_output.shape == expected_shape, (
+        "grad_output shape must match y with the last dimension halved"
+    )
+    assert grad_output.dtype == y.dtype and grad_output.device == y.device, (
+        "grad_output must have the same dtype and device as y"
+    )
+
+    flat_y = y.reshape(-1, last)
+    flat_grad = grad_output.reshape(-1, half_cols)
+    rows = flat_y.shape[0]
+    grad_input = torch.empty_like(flat_y)
+    if rows == 0:
+        return grad_input.reshape_as(y)
+
+    grid, block_m, block_i = _swiglu_launch_shape(rows, half_cols)
+    _glu_bwd_kernel[grid](
+        flat_y,
+        grad_input,
+        flat_grad,
+        rows,
+        half_cols,
+        flat_y.stride(0),
+        flat_y.stride(1),
+        grad_input.stride(0),
+        grad_input.stride(1),
+        flat_grad.stride(0),
+        flat_grad.stride(1),
+        BLOCK_M=block_m,
+        BLOCK_I=block_i,
+        CONCAT_LAYOUT=True,
+        ACT_TYPE=0,
+    )
+    return grad_input.reshape_as(y)
