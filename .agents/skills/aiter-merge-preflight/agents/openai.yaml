@@ -1,0 +1,4 @@
+interface:
+  display_name: "AITER Merge Preflight"
+  short_description: "Audit and repair ROCm/aiter PR merge gates"
+  default_prompt: "Use $aiter-merge-preflight to audit this ROCm/aiter PR before merge."
