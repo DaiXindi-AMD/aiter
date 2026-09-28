@@ -1,0 +1,512 @@
+From e35bb17f4f815903bf73598facedbb321e15af28 Mon Sep 17 00:00:00 2001
+From: root <root@gbt350-odcdh2-c02-1.png-odc.dcgpu>
+Date: Thu, 13 Aug 2026 21:48:08 -0500
+Subject: [PATCH] bench: ecfff3fa8 + Lumen swiglu kernels + hipb_mm_mixed
+ ported from e42f5791a
+
+ecfff3fa8 is what Lumen origin/main pins, and it is a direct descendant of
+the ROCm/aiter 667d6c669 this machine had installed. Its 'clean cherry-pick'
+of the Lumen kernels dropped two pieces e42f5791a (the pin recorded in
+third_party/aiter) carried, both of which Lumen calls:
+
+  - swiglu_fwd/swiglu_bwd, reached by LUMEN_FUSED_SWIGLU=1 on every arm
+  - hipb_mm_mixed, the E4M3xE5M2 wgrad GEMM the hybrid FP8 recipe needs
+
+The .cu half of the mixed GEMM also drops the same-dtype TORCH_CHECK that
+made hybrid FP8 die in the first backward.
+
+Co-authored-by: Cursor <cursoragent@cursor.com>
+---
+ ...a8w8_blockscale_bpreshuffle_tuned_gemm.csv |  10 +-
+ aiter/ops/gradlib.py                          |  29 +++
+ .../ops/triton/_triton_kernels/activation.py  |  64 +++++++
+ aiter/ops/triton/activation.py                |  58 ++++++
+ gradlib/csrc/hipbsolgemm.cu                   | 174 ++++++++++++++++--
+ 5 files changed, 313 insertions(+), 22 deletions(-)
+
+diff --git a/aiter/configs/a8w8_blockscale_bpreshuffle_tuned_gemm.csv b/aiter/configs/a8w8_blockscale_bpreshuffle_tuned_gemm.csv
+index 5f754be1f5afc0d37839702b5209fab0acc4dcf1..ec63d6e4f4e24068aab7630db3ae52b41ff775b3 100644
+--- a/aiter/configs/a8w8_blockscale_bpreshuffle_tuned_gemm.csv
++++ b/aiter/configs/a8w8_blockscale_bpreshuffle_tuned_gemm.csv
+@@ -57,8 +57,8 @@ gfx950,256,16384,7168,256,ck,16,1,85.2357,a8w8_blockscale_bpreshuffle_1x128x128_
+ gfx950,256,20480,7168,256,ck,16,0,104.9379,a8w8_blockscale_bpreshuffle_1x128x128_256x64x128x256_16x16_16x16_16x16x1_16x16x1_1x32x1x8_8_2x1_intrawave_v1,716.25,2865.31,0.0
+ gfx950,256,20480,7168,2048,ck,13,0,362.869,a8w8_blockscale_bpreshuffle_1x128x128_256x64x256x128_16x16_16x16_8x32x1_8x32x1_1x32x1x8_8_2x1_intrawave_v1,1657.06,965.15,0.0
+ gfx950,256,20480,7168,2304,ck,13,2,395.8895,a8w8_blockscale_bpreshuffle_1x128x128_256x64x256x128_16x16_16x16_8x32x1_8x32x1_1x32x1x8_8_2x1_intrawave_v1,1708.7,902.53,0.0
+-gfx942,80,2048,1024,4096,ck,13,0,85.9541,a8w8_blockscale_bpreshuffle_1x128x128_256x64x256x128_16x16_16x16_8x32x1_8x32x1_1x32x1x8_8_2x1_intrawave_v1,199.87,195.19,0.0
+-gfx942,80,2048,4096,1024,ck,14,0,90.5937,a8w8_blockscale_bpreshuffle_1x128x128_256x64x128x128_16x16_16x16_8x32x1_8x32x1_1x32x1x8_8_2x1_intrawave_v1,189.64,254.64,0.0
+-gfx942,80,2048,4096,4096,ck,14,0,263.2901,a8w8_blockscale_bpreshuffle_1x128x128_256x64x128x128_16x16_16x16_8x32x1_8x32x1_1x32x1x8_8_2x1_intrawave_v1,261.0,159.3,0.0
+-gfx942,80,2048,4096,12288,ck,14,0,724.7703,a8w8_blockscale_bpreshuffle_1x128x128_256x64x128x128_16x16_16x16_8x32x1_8x32x1_1x32x1x8_8_2x1_intrawave_v1,284.45,127.32,0.0
+-gfx942,80,2048,12288,4096,ck,14,0,766.9934,a8w8_blockscale_bpreshuffle_1x128x128_256x64x128x128_16x16_16x16_8x32x1_8x32x1_1x32x1x8_8_2x1_intrawave_v1,268.79,142.18,0.0
++gfx942,80,2048,1024,4096,ck,13,0,85.9541,a8w8_blockscale_bpreshuffle_1x128x128_256x64x256x128_16x16_16x16_8x32x1_8x32x1_1x32x1x8_8_2x1_intrawave_v1,199.87,195.19,0.0
++gfx942,80,2048,4096,1024,ck,14,0,90.5937,a8w8_blockscale_bpreshuffle_1x128x128_256x64x128x128_16x16_16x16_8x32x1_8x32x1_1x32x1x8_8_2x1_intrawave_v1,189.64,254.64,0.0
++gfx942,80,2048,4096,4096,ck,14,0,263.2901,a8w8_blockscale_bpreshuffle_1x128x128_256x64x128x128_16x16_16x16_8x32x1_8x32x1_1x32x1x8_8_2x1_intrawave_v1,261.0,159.3,0.0
++gfx942,80,2048,4096,12288,ck,14,0,724.7703,a8w8_blockscale_bpreshuffle_1x128x128_256x64x128x128_16x16_16x16_8x32x1_8x32x1_1x32x1x8_8_2x1_intrawave_v1,284.45,127.32,0.0
++gfx942,80,2048,12288,4096,ck,14,0,766.9934,a8w8_blockscale_bpreshuffle_1x128x128_256x64x128x128_16x16_16x16_8x32x1_8x32x1_1x32x1x8_8_2x1_intrawave_v1,268.79,142.18,0.0
+diff --git a/aiter/ops/gradlib.py b/aiter/ops/gradlib.py
+index 1513a1276a0efb48323ed82432c70819f5f3ccda..1963d884f57e5e057268e76943fdf905acd88e6b 100755
+--- a/aiter/ops/gradlib.py
++++ b/aiter/ops/gradlib.py
+@@ -52,6 +52,35 @@ def hipb_mm(
+ ) -> torch.Tensor: ...
+ 
+ 
++def gen_hipb_mm_mixed_fake_tensor(
++    mat1: torch.Tensor,
++    mat2: torch.Tensor,
++    solution_index: int,
++    trans_a: bool,
++    trans_b: bool,
++    scaleA: Optional[torch.Tensor] = None,
++    scaleB: Optional[torch.Tensor] = None,
++    out_dtype: Optional[torch.dtype] = None,
++):
++    m = mat1.size(1) if trans_a else mat1.size(0)
++    n = mat2.size(0) if trans_b else mat2.size(1)
++    out_dtype = out_dtype if out_dtype is not None else torch.bfloat16
++    return torch.empty((m, n), dtype=out_dtype, device=mat1.device)
++
++
++@compile_ops("module_hipbsolgemm", gen_fake=gen_hipb_mm_mixed_fake_tensor)
++def hipb_mm_mixed(
++    mat1: torch.Tensor,
++    mat2: torch.Tensor,
++    solution_index: int,
++    trans_a: bool,
++    trans_b: bool,
++    scaleA: Optional[torch.Tensor] = None,
++    scaleB: Optional[torch.Tensor] = None,
++    out_dtype: Optional[torch.dtype] = None,
++) -> torch.Tensor: ...
++
++
+ @compile_ops("module_hipbsolgemm")
+ def hipb_findallsols(
+     mat1: torch.Tensor,
+diff --git a/aiter/ops/triton/_triton_kernels/activation.py b/aiter/ops/triton/_triton_kernels/activation.py
+index 8a5c249375448d23313a80544fd8d7254ea48e7f..1cdcd5c44d73df76266c8c0c23a36fa673ed24f8 100644
+--- a/aiter/ops/triton/_triton_kernels/activation.py
++++ b/aiter/ops/triton/_triton_kernels/activation.py
+@@ -323,3 +323,67 @@ def _act_mul_and_dynamic_fp8_group_quant_kernel(
+             x_bs.to(x_bs_ptr.dtype.element_ty),
+             mask=bs_mask,
+         )
++
++# ── Fused SwiGLU forward / backward ─────────────────────────────────────
++
++@triton.jit
++def _swiglu_fwd_kernel(
++    Y_ptr, OUT_ptr,
++    stride_y_row, stride_out_row, half_cols: tl.constexpr,
++    BLOCK_SIZE: tl.constexpr,
++):
++    """Fused SwiGLU forward: silu(y1) * y2.
++
++    Input Y has shape (M, 2*half_cols). Splits along last dim, computes
++    silu on the first half and multiplies with the second half.
++    """
++    row = tl.program_id(0)
++    col_offsets = tl.arange(0, BLOCK_SIZE)
++    mask = col_offsets < half_cols
++
++    y1_ptrs = Y_ptr + row * stride_y_row + col_offsets
++    y2_ptrs = Y_ptr + row * stride_y_row + half_cols + col_offsets
++    out_ptrs = OUT_ptr + row * stride_out_row + col_offsets
++
++    y1 = tl.load(y1_ptrs, mask=mask, other=0.0).to(tl.float32)
++    y2 = tl.load(y2_ptrs, mask=mask, other=0.0).to(tl.float32)
++
++    silu_y1 = y1 * tl.sigmoid(y1)
++    result = silu_y1 * y2
++
++    tl.store(out_ptrs, result, mask=mask)
++
++
++@triton.jit
++def _swiglu_bwd_kernel(
++    GRAD_ptr, Y_ptr, DOUT_ptr,
++    stride_g_row, stride_y_row, stride_d_row, half_cols: tl.constexpr,
++    BLOCK_SIZE: tl.constexpr,
++):
++    """Fused SwiGLU backward: d_y1 = g * dsilu(y1) * y2, d_y2 = g * silu(y1).
++
++    GRAD is (M, half_cols), Y is (M, 2*half_cols), DOUT is (M, 2*half_cols).
++    """
++    row = tl.program_id(0)
++    col_offsets = tl.arange(0, BLOCK_SIZE)
++    mask = col_offsets < half_cols
++
++    g_ptrs = GRAD_ptr + row * stride_g_row + col_offsets
++    y1_ptrs = Y_ptr + row * stride_y_row + col_offsets
++    y2_ptrs = Y_ptr + row * stride_y_row + half_cols + col_offsets
++    d1_ptrs = DOUT_ptr + row * stride_d_row + col_offsets
++    d2_ptrs = DOUT_ptr + row * stride_d_row + half_cols + col_offsets
++
++    g = tl.load(g_ptrs, mask=mask, other=0.0).to(tl.float32)
++    y1 = tl.load(y1_ptrs, mask=mask, other=0.0).to(tl.float32)
++    y2 = tl.load(y2_ptrs, mask=mask, other=0.0).to(tl.float32)
++
++    sig_y1 = tl.sigmoid(y1)
++    silu_y1 = y1 * sig_y1
++    dsilu = sig_y1 * (1.0 + y1 * (1.0 - sig_y1))
++
++    d_y1 = g * dsilu * y2
++    d_y2 = g * silu_y1
++
++    tl.store(d1_ptrs, d_y1, mask=mask)
++    tl.store(d2_ptrs, d_y2, mask=mask)
+diff --git a/aiter/ops/triton/activation.py b/aiter/ops/triton/activation.py
+index a757a375509e6490ef7a53355b3de6b49dfceb2b..5d6969e222e9bbe4d6724c2430e92eb376169917 100644
+--- a/aiter/ops/triton/activation.py
++++ b/aiter/ops/triton/activation.py
+@@ -7,6 +7,8 @@ from aiter.ops.triton._triton_kernels.activation import (
+     _act_mul_and_dynamic_mxfp4_quant_kernel,
+     _act_mul_and_dynamic_fp8_group_quant_kernel,
+     fused_silu_mul_kernel,
++    _swiglu_fwd_kernel,
++    _swiglu_bwd_kernel,
+ )
+ 
+ fp8_dtype = aiter.dtypes.fp8
+@@ -307,3 +309,59 @@ def fused_silu_mul(
+         waves_per_eu=0,
+     )
+     return out
++
++# ── Fused SwiGLU ─────────────────────────────────────────────────────────
++
++
++def _next_power_of_2(n: int) -> int:
++    n -= 1
++    n |= n >> 1
++    n |= n >> 2
++    n |= n >> 4
++    n |= n >> 8
++    n |= n >> 16
++    return n + 1
++
++
++def swiglu_fwd(y: torch.Tensor) -> torch.Tensor:
++    """Fused SwiGLU forward: silu(y1) * y2 where y is split along last dim.
++
++    Single Triton kernel replacing chunk → silu → mul (3+ kernel launches).
++    """
++    assert y.shape[-1] % 2 == 0
++    flat = y.reshape(-1, y.shape[-1])
++    rows = flat.shape[0]
++    half_cols = flat.shape[1] // 2
++
++    out = torch.empty(rows, half_cols, dtype=y.dtype, device=y.device)
++    BLOCK_SIZE = min(_next_power_of_2(half_cols), 65536)
++
++    _swiglu_fwd_kernel[(rows,)](
++        flat, out,
++        flat.stride(0), out.stride(0), half_cols,
++        BLOCK_SIZE=BLOCK_SIZE,
++    )
++    return out.reshape(*y.shape[:-1], half_cols)
++
++
++def swiglu_bwd(grad_output: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
++    """Fused SwiGLU backward: computes gradient w.r.t. input y.
++
++    Single Triton kernel replacing chunk → sigmoid → mul → add → mul → silu → cat
++    (6-8 kernel launches).
++    """
++    assert y.shape[-1] % 2 == 0
++    flat_y = y.reshape(-1, y.shape[-1])
++    flat_g = grad_output.reshape(-1, grad_output.shape[-1])
++    rows = flat_y.shape[0]
++    half_cols = flat_y.shape[1] // 2
++
++    d_input = torch.empty_like(flat_y)
++    BLOCK_SIZE = min(_next_power_of_2(half_cols), 65536)
++
++    _swiglu_bwd_kernel[(rows,)](
++        flat_g, flat_y, d_input,
++        flat_g.stride(0), flat_y.stride(0), d_input.stride(0), half_cols,
++        BLOCK_SIZE=BLOCK_SIZE,
++    )
++    return d_input.reshape_as(y)
+diff --git a/gradlib/csrc/hipbsolgemm.cu b/gradlib/csrc/hipbsolgemm.cu
+index 253877bd37bc32e8ccd0d8dfaeb2922d9e6542e1..df2dc7691092e26b3688d8b5d42f639f978c5375 100644
+--- a/gradlib/csrc/hipbsolgemm.cu
++++ b/gradlib/csrc/hipbsolgemm.cu
+@@ -107,7 +107,9 @@ std::map<at::ScalarType, hipDataType> dtype_map{{at::kHalf, HIP_R_16F},
+ #ifdef ENABLE_TORCH_FP8
+                                                 ,
+                                                 {at::kFloat8_e4m3fnuz, HIP_R_8F_E4M3_FNUZ},
+-                                                {at::kFloat8_e4m3fn, HIP_R_8F_E4M3}
++                                                {at::kFloat8_e4m3fn, HIP_R_8F_E4M3},
++                                                {at::kFloat8_e5m2fnuz, HIP_R_8F_E5M2_FNUZ},
++                                                {at::kFloat8_e5m2, HIP_R_8F_E5M2}
+ #endif
+ };
+ 
+@@ -131,6 +133,7 @@ std::vector<int> hipblasLtMatmul_findallsols_wrapper(hipblasLtHandle_t handle,
+                                                      int ldc,
+                                                      const void* bias,
+                                                      hipDataType intype,
++                                                     hipDataType intypeB,
+                                                      hipDataType outtype,
+                                                      const void* scaleA,
+                                                      const void* scaleB,
+@@ -174,11 +177,11 @@ std::vector<int> hipblasLtMatmul_findallsols_wrapper(hipblasLtHandle_t handle,
+ #endif
+     if(op_B == HIPBLAS_OP_N)
+     {
+-        CHECK_HIPBLAS_ERROR(hipblasLtMatrixLayoutCreate(&matB, intype, k, n, ldb));
++        CHECK_HIPBLAS_ERROR(hipblasLtMatrixLayoutCreate(&matB, intypeB, k, n, ldb));
+     }
+     else
+     {
+-        CHECK_HIPBLAS_ERROR(hipblasLtMatrixLayoutCreate(&matB, intype, n, k, ldb));
++        CHECK_HIPBLAS_ERROR(hipblasLtMatrixLayoutCreate(&matB, intypeB, n, k, ldb));
+     }
+     CHECK_HIPBLAS_ERROR(hipblasLtMatrixLayoutCreate(&matC, outtype, m, n, ldc));
+     CHECK_HIPBLAS_ERROR(hipblasLtMatmulDescCreate(&matmul, HIPBLAS_COMPUTE_32F, HIP_R_32F));
+@@ -714,6 +717,7 @@ hipblasStatus_t hipblasLtMatmul_sol_wrapper(hipblasLtHandle_t handle,
+                                             const void* scaleC,
+                                             const void* bias,
+                                             hipDataType intype,
++                                            hipDataType intypeB,
+                                             hipDataType outtype,
+                                             const hipStream_t& stream,
+                                             int solution_index = -1,
+@@ -763,11 +767,11 @@ hipblasStatus_t hipblasLtMatmul_sol_wrapper(hipblasLtHandle_t handle,
+ #endif
+     if(op_B == HIPBLAS_OP_N)
+     {
+-        CHECK_HIPBLAS_ERROR(hipblasLtMatrixLayoutCreate(&matB, intype, k, n, ldb));
++        CHECK_HIPBLAS_ERROR(hipblasLtMatrixLayoutCreate(&matB, intypeB, k, n, ldb));
+     }
+     else
+     {
+-        CHECK_HIPBLAS_ERROR(hipblasLtMatrixLayoutCreate(&matB, intype, n, k, ldb));
++        CHECK_HIPBLAS_ERROR(hipblasLtMatrixLayoutCreate(&matB, intypeB, n, k, ldb));
+     }
+     CHECK_HIPBLAS_ERROR(hipblasLtMatrixLayoutCreate(&matC, outtype, m, n, ldc));
+     CHECK_HIPBLAS_ERROR(hipblasLtMatmulDescCreate(&matmul, HIPBLAS_COMPUTE_32F, HIP_R_32F));
+@@ -1079,14 +1083,25 @@ torch::Tensor hipb_mm(const torch::Tensor& mat1,
+     auto mat2_sizes{mat2.sizes()};
+ 
+     TORCH_CHECK(mat1.dim() == 2 && mat2.dim() == 2, "tensors must be 2-D");
+-    TORCH_CHECK(mat1.dtype() == mat2.dtype(),
+-                "expected mat1 and mat2 to have the same dtype, but got: ",
+-                mat1.dtype(),
+-                " != ",
+-                mat2.dtype());
++    // Mixed FP8 (E5M2 x E4M3) is valid for hybrid backward — hipBLASLt/MFMA
++    // select the operand format per-matrix. Only require matching dtypes for
++    // non-FP8 inputs.
++    {
++        auto _t1 = mat1.options().dtype().toScalarType();
++        auto _t2 = mat2.options().dtype().toScalarType();
++        bool _both_fp8 = dtype_map.count(_t1) && dtype_map.count(_t2)
++            && (_t1 == at::kFloat8_e4m3fnuz || _t1 == at::kFloat8_e4m3fn
++                || _t1 == at::kFloat8_e5m2fnuz || _t1 == at::kFloat8_e5m2)
++            && (_t2 == at::kFloat8_e4m3fnuz || _t2 == at::kFloat8_e4m3fn
++                || _t2 == at::kFloat8_e5m2fnuz || _t2 == at::kFloat8_e5m2);
++        TORCH_CHECK(_t1 == _t2 || _both_fp8,
++                    "expected mat1 and mat2 to have the same dtype (or both FP8), but got: ",
++                    mat1.dtype(), " != ", mat2.dtype());
++    }
+     TORCH_CHECK(mat1_sizes[1] == mat2_sizes[0], "mat1 dim 1 must match mat2 dim 0");
+ 
+     auto inDtype{mat1.options().dtype().toScalarType()};
++    auto inDtypeB{mat2.options().dtype().toScalarType()};
+     auto outDtype{out_dtype.has_value() ? out_dtype.value() : inDtype};
+     auto options{at::TensorOptions().dtype(outDtype).device(at::kCUDA)};
+     auto result{torch::empty({mat1_sizes[0], mat2_sizes[1]}, options)};
+@@ -1200,7 +1215,13 @@ torch::Tensor hipb_mm(const torch::Tensor& mat1,
+         d_scaleOut = static_cast<void*>(scaleOut.value().data_ptr());
+     }
+ 
+-    auto hipblasInType  = dtype_map.at(inDtype);
++    // Per-operand input types (mat1 and mat2 may differ for mixed FP8).
++    auto hipblasInTypeMat1 = dtype_map.at(inDtype);
++    auto hipblasInTypeMat2 = dtype_map.at(inDtypeB);
++    // ptrA/ptrB follow the same mat2<->mat1 swap as transpose_result below, so
++    // the A/B input types must be swapped in lockstep.
++    auto hipblasInType  = transpose_result ? hipblasInTypeMat2 : hipblasInTypeMat1;
++    auto hipblasInTypeB = transpose_result ? hipblasInTypeMat1 : hipblasInTypeMat2;
+     auto hipblasOutType = dtype_map.at(outDtype);
+ 
+     void* ptrA{static_cast<void*>((transpose_result ? mat2 : mat1).data_ptr())};
+@@ -1231,6 +1252,7 @@ torch::Tensor hipb_mm(const torch::Tensor& mat1,
+                                                     d_scaleOut,
+                                                     bias_ptr,
+                                                     hipblasInType,
++                                                    hipblasInTypeB,
+                                                     hipblasOutType,
+                                                     current_stream,
+                                                     solution_index,
+@@ -1241,6 +1263,101 @@ torch::Tensor hipb_mm(const torch::Tensor& mat1,
+     return result;
+ }
+ 
++// ---------------------------------------------------------------------------
++// hipb_mm_mixed: explicit-op mixed-dtype FP8 GEMM.
++//
++// Unlike hipb_mm (which infers transpose from tensor strides and always routes
++// wgrad to the Ailk_Bjlk kernel), this entry takes op_a/op_b directly so the
++// caller can request the tuned TN kernel (Alik_Bljk) that TE uses.
++//
++// Computes  C = op_a(mat1) @ op_b(mat2)  in row-major torch terms:
++//   op_a(mat1) is (m, k),  op_b(mat2) is (k, n),  C is (m, n).
++// trans_a/trans_b indicate whether the corresponding operand is transposed
++// relative to its stored (row-major, contiguous) layout.
++//
++// Both operands must be row-major contiguous (the common case for grad/input).
++// ---------------------------------------------------------------------------
++torch::Tensor hipb_mm_mixed(const torch::Tensor& mat1,
++                            const torch::Tensor& mat2,
++                            const int solution_index,
++                            const bool trans_a,
++                            const bool trans_b,
++                            std::optional<torch::Tensor> scaleA,
++                            std::optional<torch::Tensor> scaleB,
++                            std::optional<c10::ScalarType> out_dtype)
++{
++    TORCH_CHECK(mat1.dim() == 2 && mat2.dim() == 2, "tensors must be 2-D");
++    TORCH_CHECK(mat1.is_contiguous() && mat2.is_contiguous(),
++                "hipb_mm_mixed requires row-major contiguous operands");
++
++    // Logical (row-major) dims after applying trans_*.
++    int64_t m = trans_a ? mat1.size(1) : mat1.size(0);
++    int64_t ka = trans_a ? mat1.size(0) : mat1.size(1);
++    int64_t kb = trans_b ? mat2.size(1) : mat2.size(0);
++    int64_t n = trans_b ? mat2.size(0) : mat2.size(1);
++    TORCH_CHECK(ka == kb, "contraction dims must match: ", ka, " vs ", kb);
++    int64_t k = ka;
++
++    auto inTypeA = mat1.options().dtype().toScalarType();
++    auto inTypeB = mat2.options().dtype().toScalarType();
++    auto outType = out_dtype.has_value() ? out_dtype.value() : at::kBFloat16;
++    auto options = at::TensorOptions().dtype(outType).device(at::kCUDA);
++    auto result  = torch::empty({m, n}, options);  // row-major (m, n)
++
++    // hipBLASLt is column-major. A row-major (r, c) tensor is a column-major
++    // (c, r) matrix with leading dim = c = stride(0). Compute C^T = B^T @ A^T
++    // in column-major so the row-major result comes out directly:
++    //   ptrA <- mat2, ptrB <- mat1, and op flags follow.
++    // For column-major, op_col == !op_row for each operand.
++    float one{1.0f}, zero{0.0f};
++    hipblasOperation_t opA_col = trans_b ? HIPBLAS_OP_T : HIPBLAS_OP_N;  // for mat2
++    hipblasOperation_t opB_col = trans_a ? HIPBLAS_OP_T : HIPBLAS_OP_N;  // for mat1
++    void* ptrA = static_cast<void*>(mat2.data_ptr());
++    void* ptrB = static_cast<void*>(mat1.data_ptr());
++    void* ptrC = static_cast<void*>(result.data_ptr());
++    int64_t lda = mat2.stride(0);   // = mat2 row-major cols
++    int64_t ldb = mat1.stride(0);   // = mat1 row-major cols
++    int64_t ldc = result.stride(0); // = n
++
++    void* d_scaleA = scaleB.has_value() ? scaleB.value().data_ptr() : nullptr;  // scale for ptrA(=mat2)
++    void* d_scaleB = scaleA.has_value() ? scaleA.value().data_ptr() : nullptr;  // scale for ptrB(=mat1)
++
++    auto hipTypeA = dtype_map.at(inTypeB);  // ptrA is mat2
++    auto hipTypeB = dtype_map.at(inTypeA);  // ptrB is mat1
++    auto hipTypeC = dtype_map.at(outType);
++
++    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(mat1));
++    const hipStream_t current_stream = at::hip::getCurrentHIPStream();
++
++    // Column-major GEMM computes (n x m) = op(ptrA)(n x k) * op(ptrB)(k x m).
++    CHECK_HIPBLAS_ERROR(hipblasLtMatmul_sol_wrapper(hipblaslt_handle,
++                                                    opA_col,
++                                                    opB_col,
++                                                    n,
++                                                    m,
++                                                    k,
++                                                    &one,
++                                                    ptrA,
++                                                    lda,
++                                                    d_scaleA,
++                                                    ptrB,
++                                                    ldb,
++                                                    d_scaleB,
++                                                    &zero,
++                                                    ptrC,
++                                                    ldc,
++                                                    nullptr,
++                                                    nullptr,
++                                                    hipTypeA,
++                                                    hipTypeB,
++                                                    hipTypeC,
++                                                    current_stream,
++                                                    solution_index,
++                                                    false,
++                                                    false));
++    return result;
++}
++
+ // find all hipblas solutions and return them to python land
+ std::vector<int> hipb_findallsols(const torch::Tensor& mat1,
+                                   const torch::Tensor& mat2,
+@@ -1257,16 +1374,24 @@ std::vector<int> hipb_findallsols(const torch::Tensor& mat1,
+     auto mat1_sizes{mat1.sizes()};
+     auto mat2_sizes{mat2.sizes()};
+     TORCH_CHECK(mat1.dim() == 2 && mat2.dim() == 2, "tensors must be 2-D");
+-    TORCH_CHECK(mat1.dtype() == mat2.dtype(),
+-                "expected mat1 and mat2 to have the same dtype, but got: ",
+-                mat1.dtype(),
+-                " != ",
+-                mat2.dtype());
++    {
++        auto _t1 = mat1.options().dtype().toScalarType();
++        auto _t2 = mat2.options().dtype().toScalarType();
++        bool _both_fp8 = dtype_map.count(_t1) && dtype_map.count(_t2)
++            && (_t1 == at::kFloat8_e4m3fnuz || _t1 == at::kFloat8_e4m3fn
++                || _t1 == at::kFloat8_e5m2fnuz || _t1 == at::kFloat8_e5m2)
++            && (_t2 == at::kFloat8_e4m3fnuz || _t2 == at::kFloat8_e4m3fn
++                || _t2 == at::kFloat8_e5m2fnuz || _t2 == at::kFloat8_e5m2);
++        TORCH_CHECK(_t1 == _t2 || _both_fp8,
++                    "expected mat1 and mat2 to have the same dtype (or both FP8), but got: ",
++                    mat1.dtype(), " != ", mat2.dtype());
++    }
+     TORCH_CHECK(mat1_sizes[1] == mat2_sizes[0], "mat1 dim 1 must match mat2 dim 0");
+     TORCH_CHECK(!use_gelu || bias.has_value(),
+                 "hipb_findallsols(use_gelu=True) currently requires bias for GELU_BIAS epilogue");
+ 
+     auto inType{mat1.options().dtype().toScalarType()};
++    auto inTypeB{mat2.options().dtype().toScalarType()};
+     auto outType{out_dtype.has_value() ? out_dtype.value() : inType};
+ 
+     auto options{at::TensorOptions().dtype(outType).device(at::kCUDA)};
+@@ -1316,7 +1441,10 @@ std::vector<int> hipb_findallsols(const torch::Tensor& mat1,
+     int64_t mat1_ld            = mat1_strides[(transpose_mat1 == transpose_result) ? 1 : 0];
+     int64_t mat2_ld            = mat2_strides[(transpose_mat2 == transpose_result) ? 1 : 0];
+     int64_t result_ld          = result.stride(transpose_result ? 0 : 1);
+-    hipDataType hipblasInType  = dtype_map.at(inType);
++    hipDataType hipblasInTypeMat1 = dtype_map.at(inType);
++    hipDataType hipblasInTypeMat2 = dtype_map.at(inTypeB);
++    hipDataType hipblasInType  = transpose_result ? hipblasInTypeMat2 : hipblasInTypeMat1;
++    hipDataType hipblasInTypeB = transpose_result ? hipblasInTypeMat1 : hipblasInTypeMat2;
+     hipDataType hipblasOutType = dtype_map.at(outType);
+ 
+     void* ptrA{static_cast<void*>((transpose_result ? mat2 : mat1).data_ptr())};
+@@ -1362,6 +1490,7 @@ std::vector<int> hipb_findallsols(const torch::Tensor& mat1,
+                                                result_ld,
+                                                bias_ptr,
+                                                hipblasInType,
++                                               hipblasInTypeB,
+                                                hipblasOutType,
+                                                scaleA_ptr,
+                                                scaleB_ptr,
+@@ -1437,6 +1566,17 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
+           py::arg("scaleOut")    = std::nullopt,
+           py::arg("bpreshuffle") = std::nullopt,
+           py::arg("use_gelu")    = std::nullopt);
++    m.def("hipb_mm_mixed",
++          &hipb_mm_mixed,
++          "hipb_mm_mixed (explicit op, mixed FP8)",
++          py::arg("mat1"),
++          py::arg("mat2"),
++          py::arg("solution_index"),
++          py::arg("trans_a"),
++          py::arg("trans_b"),
++          py::arg("scaleA")    = std::nullopt,
++          py::arg("scaleB")    = std::nullopt,
++          py::arg("out_dtype") = std::nullopt);
+     m.def("hipb_findallsols",
+           &hipb_findallsols,
+           "hipb_findallsols",

@@ -1,0 +1,17 @@
+fa45a20c3f7b9aa70f9152ed0b1905adc1bae113f519b635b19479693d110ab5  /home/xdai/aiter-backup-20260928/aiter/ops/triton/_triton_kernels/activation.py
+e21606622ba1647a6180a44657fdfe24263217cfa06b9520b7acec27df08a4ad  /home/xdai/aiter-backup-20260928/aiter/ops/triton/_triton_kernels/quant/fused_swiglu_dual_layout_mxfp4.py
+48af95e3062f3cbe9e6ad5aab2cd63b1428d6f692a754a80816693ce6bfa962e  /home/xdai/aiter-backup-20260928/aiter/ops/triton/_triton_kernels/quant/quant.py
+f9c8cea98cbc06a5d840b0ce5e72b4119e10cd3bfb36759fa9525b4901f9dfe2  /home/xdai/aiter-backup-20260928/aiter/ops/triton/activation.py
+60ed162a62ec79f7640d9042249804ded8d6ace73691ed9131df4ec9de08379b  /home/xdai/aiter-backup-20260928/aiter/ops/triton/configs/quant/gfx950-FUSED-SWIGLU-DUAL-LAYOUT-MXFP4.json
+fa27b490162552ab5dd440a578e5a603c6a81e8a380ad3d944640b7ab5141acd  /home/xdai/aiter-backup-20260928/aiter/ops/triton/quant/__init__.py
+c0cf49ed318687122a21247c698a058bc6c8b94f8580d3e051fb093e3fa7a8d1  /home/xdai/aiter-backup-20260928/aiter/ops/triton/quant/fused_swiglu_dual_layout_mxfp4.py
+cdc2e38f9d0795b68d1ba2f2629cdfe202ec46afcf41a575755f0b009fb858ff  /home/xdai/aiter-backup-20260928/aiter/ops/triton/quant/quant.py
+9d3c66404c1bf62770d6bbeed86afaade3e1d704465b8c48dc37a50d058c4ccd  /home/xdai/aiter-backup-20260928/aiter/ops/triton/utils/_triton/activation.py
+bd67fc3e015c645ccbe03a7d2106832f2292d86efdb55e5b3b6c0e4d8443a4db  /home/xdai/aiter-backup-20260928/aiter/ops/triton/utils/_triton/shuffle.py
+06532bae47a6cfdc19672f1fb34a2e436c15469d7c795b3583596bfb6a6e39e3  /home/xdai/aiter-backup-20260928/aiter/ops/triton/utils/quant_config_utils.py
+9ee0b633047dd15275feb3fc1da848e8e7c02fa8d531012042022055a5322fc2  /home/xdai/aiter-backup-20260928/op_tests/op_benchmarks/triton/bench_fused_swiglu_dual_layout_mxfp4.py
+cf3d80b2658cca6bba0cdaa784082f10df9216a691fbf27c70fd12155c6ec566  /home/xdai/aiter-backup-20260928/op_tests/op_benchmarks/triton/bench_quant_mxfp4_2way.py
+f87bcc79538585b078025c053a6577f846bfac9a69ea3afb10a93984ba767a9c  /home/xdai/aiter-backup-20260928/op_tests/op_benchmarks/triton/bench_swiglu.py
+dbef7b5fda0d2ab2d202a9b65a05c14868d600bcf84a6672d93675c8ec4c6f0e  /home/xdai/aiter-backup-20260928/op_tests/triton_tests/fusions/test_fused_silu_mul.py
+b740b91ae6a699ecd1029c727732542a97fc78fddb67f4a7d768289390105603  /home/xdai/aiter-backup-20260928/op_tests/triton_tests/quant/test_fused_swiglu_dual_layout_mxfp4.py
+6617fc152a3e2ba714c03173608813c41a64d1aada0c38ad52f6f56d2479b2d3  /home/xdai/aiter-backup-20260928/op_tests/triton_tests/quant/test_quant_mxfp4_2way.py
