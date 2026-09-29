@@ -21,9 +21,12 @@ branch.
 - `recovery/mxfp4-pending-operators.bundle` preserves the exact clean
   dual-layout ref and stacked dequant-H16 WIP ref. Direct branch creation was
   blocked by an OAuth credential without GitHub's `workflow` scope.
-- `recovery/bench-ecfff3f-lumen-base.bundle` preserves the exact runtime base
-  commit `e35bb17f4f815903bf73598facedbb321e15af28`; it requires parent
-  `ecfff3fa80f906c5c421a35a7f5e52842f000559`.
+- `recovery/bench-ecfff3f-lumen-portable.bundle` preserves the exact runtime
+  base commit `e35bb17f4f815903bf73598facedbb321e15af28` plus all nine commits not
+  reachable from current ROCm/main. Its only prerequisite is the shared
+  ancestor `5f930ea50a36abd214d8710c801f95ca01efdd67`.
+- `recovery/bench-ecfff3f-lumen-base.bundle` is the smaller historical bundle;
+  it requires `ecfff3fa8` and should not be used for a fresh clone.
 - `recovery/bench-ecfff3f-lumen-base.patch` is a human-readable fallback for
   reconstructing that one base commit.
 - `.agents/skills/aiter-merge-preflight/` is agent-only support material and is
@@ -34,6 +37,7 @@ Artifact checksums:
 ```text
 8db4c9870a7aa70b714a242ce225731ddba286553b59e6e1fc18857365f99067  recovery/bench-ecfff3f-lumen-base.bundle
 1c1915165fe0576a78d1a0d68b7fb29fc7db0c1a4e777d8baaf56b93a77b30c7  recovery/bench-ecfff3f-lumen-base.patch
+decfb9c01807b035c8aa2f811245c92655c97d020e33fef8a6fc7028edd7afa0  recovery/bench-ecfff3f-lumen-portable.bundle
 205f595307e231c5a05690666596c3dadab31c029a3a1f53f81767672cfed254  recovery/mxfp4-pending-operators.bundle
 ```
 
@@ -86,8 +90,8 @@ git fetch /tmp/mxfp4-pending-operators.bundle \
   refs/heads/dai/mxfp4-dequant-h16-requant-upstream:refs/heads/restore/mxfp4-dequant-h16
 ```
 
-To recover the research WIP in a separate checkout, extract the older runtime
-base bundle and restore the 21 preserved paths:
+To recover the research WIP in a separate checkout, extract the portable
+runtime-base bundle and restore the 21 preserved paths:
 
 ```bash
 git clone https://github.com/ROCm/aiter.git
@@ -96,12 +100,13 @@ cd aiter
 git fetch https://github.com/DaiXindi-AMD/aiter.git \
   refs/heads/backup/2026-09-29/mxfp4-current-handoff:refs/remotes/recovery/mxfp4-current-handoff
 
-git show refs/remotes/recovery/mxfp4-current-handoff:recovery/bench-ecfff3f-lumen-base.bundle \
-  > /tmp/bench-ecfff3f-lumen-base.bundle
-test "$(sha256sum /tmp/bench-ecfff3f-lumen-base.bundle | cut -d' ' -f1)" = \
-  8db4c9870a7aa70b714a242ce225731ddba286553b59e6e1fc18857365f99067
+git show refs/remotes/recovery/mxfp4-current-handoff:recovery/bench-ecfff3f-lumen-portable.bundle \
+  > /tmp/bench-ecfff3f-lumen-portable.bundle
+test "$(sha256sum /tmp/bench-ecfff3f-lumen-portable.bundle | cut -d' ' -f1)" = \
+  decfb9c01807b035c8aa2f811245c92655c97d020e33fef8a6fc7028edd7afa0
 
-git fetch /tmp/bench-ecfff3f-lumen-base.bundle \
+git bundle verify /tmp/bench-ecfff3f-lumen-portable.bundle
+git fetch /tmp/bench-ecfff3f-lumen-portable.bundle \
   refs/heads/bench/ecfff3f-lumen:refs/heads/recovery/ecfff3f-lumen-base
 git switch recovery/ecfff3f-lumen-base
 test "$(git rev-parse HEAD)" = e35bb17f4f815903bf73598facedbb321e15af28
