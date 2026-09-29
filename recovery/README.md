@@ -8,18 +8,27 @@ branch.
 
 ## What is preserved
 
-- The 17 AITER code, test, benchmark, helper, and gfx950 config files from the
+- The 21 AITER code, test, benchmark, helper, and gfx950 config files from the
   dirty `/home/xdai/aiter` worktree are captured at their 2026-09-29 state.
   Seven files changed after the earlier `35e796da`/2026-09-28 snapshot.
-- `recovery/dirty-code-paths.txt` lists those 17 files.
+- Four additional files preserve the completed backward-fusion correctness
+  work and its exact-shape benchmark: two gfx950 configs, one test, and one
+  benchmark.
+- `recovery/dirty-code-paths.txt` lists all 21 files.
 - `recovery/dirty-code-files.sha256` records their SHA256 checksums.
 - `HANDOFF_AITER_LUMEN_2026-09-29.md` records the two operator branches,
   validation evidence, remaining work, Lumen state, and new-machine recovery.
+- `recovery/mxfp4-pending-operators.bundle` preserves the exact clean
+  dual-layout ref and stacked dequant-H16 WIP ref. Direct branch creation was
+  blocked by an OAuth credential without GitHub's `workflow` scope.
 - `recovery/bench-ecfff3f-lumen-base.bundle` preserves the exact runtime base
   commit `e35bb17f4f815903bf73598facedbb321e15af28`; it requires parent
   `ecfff3fa80f906c5c421a35a7f5e52842f000559`.
 - `recovery/bench-ecfff3f-lumen-base.patch` is a human-readable fallback for
   reconstructing that one base commit.
+- `recovery/mxfp4-pending-operators.bundle` preserves the two clean newer-base
+  operator branches (`deaf07a98` dual-layout and `46f576753` dequant-H16 WIP),
+  whose direct refs were not visible on the fork during final verification.
 - `.agents/skills/aiter-merge-preflight/` is agent-only support material and is
   deliberately separate from product code.
 
@@ -28,6 +37,8 @@ Artifact checksums:
 ```text
 8db4c9870a7aa70b714a242ce225731ddba286553b59e6e1fc18857365f99067  recovery/bench-ecfff3f-lumen-base.bundle
 1c1915165fe0576a78d1a0d68b7fb29fc7db0c1a4e777d8baaf56b93a77b30c7  recovery/bench-ecfff3f-lumen-base.patch
+205f595307e231c5a05690666596c3dadab31c029a3a1f53f81767672cfed254  recovery/mxfp4-pending-operators.bundle
+205f595307e231c5a05690666596c3dadab31c029a3a1f53f81767672cfed254  recovery/mxfp4-pending-operators.bundle
 ```
 
 The source worktree fingerprint for its tracked diff is:
@@ -42,19 +53,45 @@ The committed AITER base `e35bb17f4` was built specifically for Lumen. It is
 one commit above Lumen's `third_party/aiter` pin `ecfff3fa8` and adds the
 SwiGLU forward/backward API and `hipb_mm_mixed` support used by Lumen paths.
 
-The dirty snapshot adds two groups:
+The dirty snapshot adds three groups:
 
 1. Lumen-integrated dependencies: split/eager-compatible SwiGLU and the
    two-source MXFP4 quantizer used by the packed gate/up weight cache, together
    with their shared helpers, tests, and benchmarks.
-2. Future WIP: fused SwiGLU plus dual-layout MXFP4 output, with a public wrapper,
-   Triton kernel, gfx950 config, test, and benchmark. Current Lumen does not call
-   this fused public API, so it must be evaluated and integrated separately.
+2. Positive micro-only WIP: fused SwiGLU forward plus dual-layout MXFP4 output.
+   It is bitwise equal to the matching two-stage path and measured
+   `1.0369x--1.0620x` faster in three fresh processes at `(16384, 12288)`, but
+   has no Lumen E2E or NLL result.
+3. Rejected full-backward fusion WIP: correctness reached `23 passed, 1 skipped`,
+   but the production-parity BM256 implementation measured `0.9746x` versus the
+   unfused chain and BM32 measured `0.7398x`. Keep it for redesign/reference;
+   do not integrate it into Lumen as a speed optimization.
 
 ## Exact recovery procedure
 
-Fetch this recovery branch, extract the small bundle, recreate the exact AITER
-base, and then restore only the 17 dirty paths into the worktree:
+Recover the two pending operator refs first:
+
+```bash
+git clone https://github.com/DaiXindi-AMD/aiter.git
+cd aiter
+git remote add upstream https://github.com/ROCm/aiter.git
+git fetch upstream main
+git fetch origin backup/2026-09-29/mxfp4-current-handoff
+
+git show \
+  origin/backup/2026-09-29/mxfp4-current-handoff:recovery/mxfp4-pending-operators.bundle \
+  > /tmp/mxfp4-pending-operators.bundle
+test "$(sha256sum /tmp/mxfp4-pending-operators.bundle | cut -d' ' -f1)" = \
+  205f595307e231c5a05690666596c3dadab31c029a3a1f53f81767672cfed254
+
+git bundle verify /tmp/mxfp4-pending-operators.bundle
+git fetch /tmp/mxfp4-pending-operators.bundle \
+  refs/heads/dai/mxfp4-dual-layout-upstream:refs/heads/restore/mxfp4-dual-layout \
+  refs/heads/dai/mxfp4-dequant-h16-requant-upstream:refs/heads/restore/mxfp4-dequant-h16
+```
+
+To recover the research WIP in a separate checkout, extract the older runtime
+base bundle and restore the 21 preserved paths:
 
 ```bash
 git clone https://github.com/ROCm/aiter.git
@@ -86,3 +123,16 @@ The final command must print the tracked-diff fingerprint above. Verify the
 untracked source files against `recovery/dirty-code-files.sha256` from the
 recovery ref. Restore `.agents/skills/aiter-merge-preflight/` separately only
 if the new Agent needs that local helper.
+
+To restore the two clean newer-base operator branches, extract and fetch the
+second bundle after fetching upstream commit `475cf0f607`:
+
+```bash
+git show refs/remotes/recovery/mxfp4-current-handoff:recovery/mxfp4-pending-operators.bundle \
+  > /tmp/mxfp4-pending-operators.bundle
+test "$(sha256sum /tmp/mxfp4-pending-operators.bundle | cut -d' ' -f1)" = \
+  205f595307e231c5a05690666596c3dadab31c029a3a1f53f81767672cfed254
+git fetch /tmp/mxfp4-pending-operators.bundle \
+  refs/heads/dai/mxfp4-dual-layout-upstream:refs/heads/recovery/mxfp4-dual-layout-upstream \
+  refs/heads/dai/mxfp4-dequant-h16-requant-upstream:refs/heads/recovery/mxfp4-dequant-h16-requant-upstream
+```

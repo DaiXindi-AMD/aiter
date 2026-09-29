@@ -58,16 +58,24 @@ next Agent that #5542 merged unless GitHub is checked again.
 
 ## Remote recovery refs
 
-All new refs live in the user's forks. The `backup/...` refs are recovery
-snapshots and must not be used directly as PR branches.
+The recovery snapshots live in the user's forks. The `backup/...` refs must
+not be used directly as PR branches.
+
+At handoff, direct HTTPS creation of the two operator refs was rejected because
+the available OAuth credential lacks GitHub's `workflow` scope and the newer
+upstream history contains workflow-file changes. SSH was not configured. The
+exact two refs and commit objects are therefore stored in
+`recovery/mxfp4-pending-operators.bundle` on the AITER backup branch. This is
+the authoritative portable copy until the refs are pushed with suitable
+credentials.
 
 ### DaiXindi-AMD/aiter
 
 | Remote branch | Expected source commit | Use |
 | --- | --- | --- |
-| `dai/mxfp4-dual-layout-upstream` | `deaf07a98bfa3c09f24f936e2531f7a0c85ee9ec` | clean dual-layout operator PR branch |
-| `dai/mxfp4-dequant-h16-requant-upstream-wip` | `46f57675342fde4622d17c446aef4d4e823e5ef5` | stacked dequant-H16 WIP; not PR-ready |
-| `backup/2026-09-29/mxfp4-current-handoff` | resolve after fetch | complete handoff document plus current research-WIP snapshot |
+| `dai/mxfp4-dual-layout-upstream` | `deaf07a98bfa3c09f24f936e2531f7a0c85ee9ec` | intended PR ref; not published at handoff, recover from bundle |
+| `dai/mxfp4-dequant-h16-requant-upstream-wip` | `46f57675342fde4622d17c446aef4d4e823e5ef5` | intended WIP ref; not published at handoff, recover from bundle |
+| `backup/2026-09-29/mxfp4-current-handoff` | resolve after fetch | handoff, exact operator bundle, and current research-WIP snapshot |
 | `backup/2026-09-28/ecfff3f-lumen-portable-wip` | `5d7178517e5f3947b7496fa5994696aa2fb9c50d` | previous portable snapshot retained for comparison |
 
 ### DaiXindi-AMD/Lumen
@@ -76,9 +84,13 @@ snapshots and must not be used directly as PR branches.
 | --- | --- | --- |
 | `backup/2026-09-29/aiter-kernel-migration-handoff` | contains `0f2cc90398ad05379d4eff125cfd365aaa71a7ce` | Lumen migration prototype and integration documents |
 
-If a ref is missing, inspect the local source paths recorded at the end of this
-document before doing anything else. The handoff procedure that created these
-refs was not intended to open PRs automatically.
+The operator bundle SHA256 is:
+
+```text
+205f595307e231c5a05690666596c3dadab31c029a3a1f53f81767672cfed254
+```
+
+The handoff procedure was not intended to open PRs automatically.
 
 ## Operator 1: dual-layout H16 MXFP4 quantization
 
@@ -221,7 +233,7 @@ benchmark, and confirm that no new equivalent kernel/helper has appeared.
 
 ```text
 Local branch: dai/mxfp4-dequant-h16-requant-upstream
-Remote WIP:   dai/mxfp4-dequant-h16-requant-upstream-wip
+Bundle ref:   refs/heads/dai/mxfp4-dequant-h16-requant-upstream
 Base stack:   475cf0f607 -> deaf07a98 -> 46f576753
 WIP commit:   46f57675342fde4622d17c446aef4d4e823e5ef5
 Subject:      feat(triton): add MXFP4 dequant H16 requantization
@@ -360,8 +372,19 @@ MXFP4 quantization, shared activation/shuffle helpers, tests, benchmarks, and
 configs. It is not one of the two submission branches.
 
 The 2026-09-29 recovery branch updates seven files that changed after the
-2026-09-28 portable snapshot and retains all 17 preserved code paths. It is
-research/integration source only:
+2026-09-28 portable snapshot and preserves 21 code paths in total. The four
+late additions are two gfx950 configs, a backward-fusion test, and its
+exact-shape benchmark.
+
+The forward fused SwiGLU plus dual-layout prototype was bitwise equal to its
+two-stage comparison and measured `1.0369x--1.0620x` faster at
+`(16384, 12288)` in three fresh processes, but it has no Lumen end-to-end or
+NLL result. The full-backward fusion reached `23 passed, 1 skipped`, but its
+production-parity BM256 path measured `0.9746x` and BM32 measured `0.7398x`
+versus the unfused chain. Keep the backward fusion for redesign/reference; do
+not integrate it as a speed optimization in its current form.
+
+The snapshot is research/integration source only:
 
 - do not submit the backup branch as a PR;
 - do not mix it into either production operator without a new duplicate search;
@@ -441,19 +464,25 @@ git clone https://github.com/DaiXindi-AMD/aiter.git
 cd aiter
 git remote add upstream https://github.com/ROCm/aiter.git
 git fetch upstream main
-git fetch origin \
-  dai/mxfp4-dual-layout-upstream \
-  dai/mxfp4-dequant-h16-requant-upstream-wip \
-  backup/2026-09-29/mxfp4-current-handoff \
-  backup/2026-09-28/ecfff3f-lumen-portable-wip
+git fetch origin backup/2026-09-29/mxfp4-current-handoff
+
+git show \
+  origin/backup/2026-09-29/mxfp4-current-handoff:recovery/mxfp4-pending-operators.bundle \
+  > /tmp/mxfp4-pending-operators.bundle
+
+test "$(sha256sum /tmp/mxfp4-pending-operators.bundle | cut -d' ' -f1)" = \
+  205f595307e231c5a05690666596c3dadab31c029a3a1f53f81767672cfed254
+
+git bundle verify /tmp/mxfp4-pending-operators.bundle
+git fetch /tmp/mxfp4-pending-operators.bundle \
+  refs/heads/dai/mxfp4-dual-layout-upstream:refs/heads/restore/mxfp4-dual-layout \
+  refs/heads/dai/mxfp4-dequant-h16-requant-upstream:refs/heads/restore/mxfp4-dequant-h16
 
 git worktree add ../aiter-dual-layout \
-  -b restore/mxfp4-dual-layout \
-  origin/dai/mxfp4-dual-layout-upstream
+  restore/mxfp4-dual-layout
 
 git worktree add ../aiter-dequant-h16 \
-  -b restore/mxfp4-dequant-h16 \
-  origin/dai/mxfp4-dequant-h16-requant-upstream-wip
+  restore/mxfp4-dequant-h16
 
 git worktree add ../aiter-recovery-snapshot \
   -b restore/mxfp4-current-handoff \
@@ -538,4 +567,3 @@ is released:
 /home/xdai/aiter-kernel-migration
 /home/xdai/Lumen-kernel-migration
 ```
-
