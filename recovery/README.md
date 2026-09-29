@@ -26,9 +26,6 @@ branch.
   `ecfff3fa80f906c5c421a35a7f5e52842f000559`.
 - `recovery/bench-ecfff3f-lumen-base.patch` is a human-readable fallback for
   reconstructing that one base commit.
-- `recovery/mxfp4-pending-operators.bundle` preserves the two clean newer-base
-  operator branches (`deaf07a98` dual-layout and `46f576753` dequant-H16 WIP),
-  whose direct refs were not visible on the fork during final verification.
 - `.agents/skills/aiter-merge-preflight/` is agent-only support material and is
   deliberately separate from product code.
 
@@ -37,7 +34,6 @@ Artifact checksums:
 ```text
 8db4c9870a7aa70b714a242ce225731ddba286553b59e6e1fc18857365f99067  recovery/bench-ecfff3f-lumen-base.bundle
 1c1915165fe0576a78d1a0d68b7fb29fc7db0c1a4e777d8baaf56b93a77b30c7  recovery/bench-ecfff3f-lumen-base.patch
-205f595307e231c5a05690666596c3dadab31c029a3a1f53f81767672cfed254  recovery/mxfp4-pending-operators.bundle
 205f595307e231c5a05690666596c3dadab31c029a3a1f53f81767672cfed254  recovery/mxfp4-pending-operators.bundle
 ```
 
@@ -123,16 +119,3 @@ The final command must print the tracked-diff fingerprint above. Verify the
 untracked source files against `recovery/dirty-code-files.sha256` from the
 recovery ref. Restore `.agents/skills/aiter-merge-preflight/` separately only
 if the new Agent needs that local helper.
-
-To restore the two clean newer-base operator branches, extract and fetch the
-second bundle after fetching upstream commit `475cf0f607`:
-
-```bash
-git show refs/remotes/recovery/mxfp4-current-handoff:recovery/mxfp4-pending-operators.bundle \
-  > /tmp/mxfp4-pending-operators.bundle
-test "$(sha256sum /tmp/mxfp4-pending-operators.bundle | cut -d' ' -f1)" = \
-  205f595307e231c5a05690666596c3dadab31c029a3a1f53f81767672cfed254
-git fetch /tmp/mxfp4-pending-operators.bundle \
-  refs/heads/dai/mxfp4-dual-layout-upstream:refs/heads/recovery/mxfp4-dual-layout-upstream \
-  refs/heads/dai/mxfp4-dequant-h16-requant-upstream:refs/heads/recovery/mxfp4-dequant-h16-requant-upstream
-```
