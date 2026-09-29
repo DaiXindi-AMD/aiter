@@ -108,6 +108,102 @@ def _mxfp4_e8m0_to_fp32(scales):
 
 
 @triton.jit
+def _mxfp4_sr_random_words(
+    philox_seed,
+    philox_offset,
+    source_tile_id,
+    row_start,
+    col_start,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    RNG_BLOCK_M: tl.constexpr,
+    RNG_BLOCK_N: tl.constexpr,
+    PHILOX_ROUNDS: tl.constexpr,
+):
+    """Generate Philox words using logical coordinates, independent of launch tiles."""
+    tl.static_assert(RNG_BLOCK_M % BLOCK_SIZE_M == 0)
+    tl.static_assert(RNG_BLOCK_N % BLOCK_SIZE_N == 0)
+    tl.static_assert(RNG_BLOCK_N % 8 == 0)
+
+    rows = row_start + tl.arange(0, BLOCK_SIZE_M)
+    packed_cols = col_start // 2 + tl.arange(0, BLOCK_SIZE_N // 2)
+    rows_in_tile = rows % RNG_BLOCK_M
+    packed_cols_in_tile = packed_cols % (RNG_BLOCK_N // 2)
+    counters_per_row: tl.constexpr = RNG_BLOCK_N // 8
+    counter_cols = packed_cols_in_tile // 4
+    word_lanes = packed_cols_in_tile % 4
+    offsets = (
+        philox_offset
+        + source_tile_id * RNG_BLOCK_M * counters_per_row
+        + rows_in_tile[:, None] * counters_per_row
+        + counter_cols[None, :]
+    )
+    random_0, random_1, random_2, random_3 = tl.randint4x(
+        philox_seed, offsets, PHILOX_ROUNDS
+    )
+    # Match nested ``join(join(r0, r1), join(r2, r3))`` minor-axis ordering.
+    return tl.where(
+        word_lanes[None, :] == 0,
+        random_0,
+        tl.where(
+            word_lanes[None, :] == 1,
+            random_2,
+            tl.where(word_lanes[None, :] == 2, random_1, random_3),
+        ),
+    )
+
+
+@triton.jit
+def _mxfp4_sr_pack(
+    x,
+    scales,
+    random_words,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    MXFP4_QUANT_BLOCK_SIZE: tl.constexpr,
+):
+    """Pack adjacent values with gfx950 stochastic scaled E2M1 conversion."""
+    HALF_BLOCK_SIZE_N: tl.constexpr = BLOCK_SIZE_N // 2
+    HALF_QUANT_BLOCK_SIZE: tl.constexpr = MXFP4_QUANT_BLOCK_SIZE // 2
+    NUM_QUANT_BLOCKS: tl.constexpr = BLOCK_SIZE_N // MXFP4_QUANT_BLOCK_SIZE
+    x_low, x_high = tl.split(x.reshape(BLOCK_SIZE_M, HALF_BLOCK_SIZE_N, 2))
+    scale_fp32 = _mxfp4_e8m0_to_fp32(scales)
+    scale_fp32 = (
+        scale_fp32.expand_dims(axis=2)
+        .broadcast_to(BLOCK_SIZE_M, NUM_QUANT_BLOCKS, HALF_QUANT_BLOCK_SIZE)
+        .reshape(BLOCK_SIZE_M, HALF_BLOCK_SIZE_N)
+    )
+
+    if x_low.type.element_ty == tl.float32:
+        packed_input = (
+            x_high.to(tl.uint32, bitcast=True).to(tl.uint64) << 32
+        ) | x_low.to(tl.uint32, bitcast=True)
+        packed = tl.inline_asm_elementwise(
+            asm="v_cvt_scalef32_sr_pk_fp4_f32 $0, $1, $2, $3 op_sel:[0,0,0,0];",
+            constraints="=&v,v,v,v",
+            args=[packed_input, random_words, scale_fp32],
+            dtype=tl.uint32,
+            is_pure=True,
+            pack=1,
+        )
+    else:
+        tl.static_assert(x_low.type.element_ty == tl.bfloat16)
+        packed_input = (
+            x_high.to(tl.uint16, bitcast=True).to(tl.uint32) << 16
+        ) | x_low.to(tl.uint16, bitcast=True)
+        packed = tl.inline_asm_elementwise(
+            asm="v_cvt_scalef32_sr_pk_fp4_bf16 $0, $1, $2, $3 op_sel:[0,0,0,0];",
+            constraints="=&v,v,v,v",
+            args=[packed_input, random_words, scale_fp32],
+            dtype=tl.uint32,
+            is_pure=True,
+            pack=1,
+        )
+
+    return (packed & 0xFF).to(tl.uint8).reshape(BLOCK_SIZE_M, HALF_BLOCK_SIZE_N)
+
+
+@triton.jit
 def _mxfp4_rtn_pack(
     x,
     scales,

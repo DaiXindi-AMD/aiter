@@ -3,7 +3,7 @@ from .quant.fused_fp8_quant import _fp8_quant_op
 import triton
 import triton.language as tl
 
-from aiter.ops.triton.utils._triton.activation import _silu_exp2
+from aiter.ops.triton.utils._triton.activation import _sigmoid_exp2, _silu_exp2
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
 
@@ -435,7 +435,7 @@ def _swiglu_bwd_kernel(
     up = tl.load(up_ptrs, mask=mask, other=0.0).to(tl.float32)
 
     if EAGER_ROUNDING:
-        sigmoid = 1.0 / (1.0 + tl.exp2(-(gate * 1.44269504089)))
+        sigmoid = _sigmoid_exp2(gate)
     else:
         sigmoid = tl.sigmoid(gate)
     silu = gate * sigmoid

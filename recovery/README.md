@@ -1,5 +1,7 @@
 # Lumen MXFP4 AITER recovery snapshot
 
+Updated: 2026-09-29
+
 This is a non-submission recovery snapshot for the Lumen Qwen3-8B MXFP4
 optimization work. Do not merge this branch wholesale into an AITER product
 branch.
@@ -7,10 +9,12 @@ branch.
 ## What is preserved
 
 - The 17 AITER code, test, benchmark, helper, and gfx950 config files from the
-  dirty `/home/xdai/aiter` worktree are byte-identical to commit
-  `35e796da188e2131d004e5b17391b7b8e836d852` and this branch.
+  dirty `/home/xdai/aiter` worktree are captured at their 2026-09-29 state.
+  Seven files changed after the earlier `35e796da`/2026-09-28 snapshot.
 - `recovery/dirty-code-paths.txt` lists those 17 files.
 - `recovery/dirty-code-files.sha256` records their SHA256 checksums.
+- `HANDOFF_AITER_LUMEN_2026-09-29.md` records the two operator branches,
+  validation evidence, remaining work, Lumen state, and new-machine recovery.
 - `recovery/bench-ecfff3f-lumen-base.bundle` preserves the exact runtime base
   commit `e35bb17f4f815903bf73598facedbb321e15af28`; it requires parent
   `ecfff3fa80f906c5c421a35a7f5e52842f000559`.
@@ -29,7 +33,7 @@ Artifact checksums:
 The source worktree fingerprint for its tracked diff is:
 
 ```text
-a5476078484e426e951c2a5e62233cb20f26c103f93656e02a690e294e9f9aa0
+fea7601c09d062b3bbb7fa8dcfc0888b87876dcfd133d10f3d1147d78409477a
 ```
 
 ## Relationship to Lumen
@@ -57,9 +61,9 @@ git clone https://github.com/ROCm/aiter.git
 cd aiter
 
 git fetch https://github.com/DaiXindi-AMD/aiter.git \
-  refs/heads/backup/2026-09-28/ecfff3f-lumen-portable-wip:refs/remotes/recovery/ecfff3f-lumen-portable-wip
+  refs/heads/backup/2026-09-29/mxfp4-current-handoff:refs/remotes/recovery/mxfp4-current-handoff
 
-git show refs/remotes/recovery/ecfff3f-lumen-portable-wip:recovery/bench-ecfff3f-lumen-base.bundle \
+git show refs/remotes/recovery/mxfp4-current-handoff:recovery/bench-ecfff3f-lumen-base.bundle \
   > /tmp/bench-ecfff3f-lumen-base.bundle
 test "$(sha256sum /tmp/bench-ecfff3f-lumen-base.bundle | cut -d' ' -f1)" = \
   8db4c9870a7aa70b714a242ce225731ddba286553b59e6e1fc18857365f99067
@@ -69,10 +73,10 @@ git fetch /tmp/bench-ecfff3f-lumen-base.bundle \
 git switch recovery/ecfff3f-lumen-base
 test "$(git rev-parse HEAD)" = e35bb17f4f815903bf73598facedbb321e15af28
 
-git show refs/remotes/recovery/ecfff3f-lumen-portable-wip:recovery/dirty-code-paths.txt \
+git show refs/remotes/recovery/mxfp4-current-handoff:recovery/dirty-code-paths.txt \
   > /tmp/aiter-lumen-mxfp4-dirty-code-paths.txt
 xargs -a /tmp/aiter-lumen-mxfp4-dirty-code-paths.txt \
-  git restore --source=refs/remotes/recovery/ecfff3f-lumen-portable-wip --worktree --
+  git restore --source=refs/remotes/recovery/mxfp4-current-handoff --worktree --
 
 git status --short
 git diff --binary HEAD | sha256sum
@@ -82,4 +86,3 @@ The final command must print the tracked-diff fingerprint above. Verify the
 untracked source files against `recovery/dirty-code-files.sha256` from the
 recovery ref. Restore `.agents/skills/aiter-merge-preflight/` separately only
 if the new Agent needs that local helper.
-

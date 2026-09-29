@@ -37,7 +37,11 @@ from .fused_mxfp8_quant import (
     fused_dual_rmsnorm_mxfp8_quant,
     fused_flatten_mxfp8_quant,
 )
-from .fused_swiglu_dual_layout_mxfp4 import fused_swiglu_dual_layout_mxfp4
+from .fused_swiglu_dual_layout_mxfp4 import (
+    dual_layout_quant_mxfp4,
+    fused_swiglu_bwd_dual_layout_mxfp4,
+    fused_swiglu_dual_layout_mxfp4,
+)
 
 __all__ = [
     # quant.py exports
@@ -73,5 +77,7 @@ __all__ = [
     "fused_dual_rmsnorm_mxfp8_quant",
     "fused_flatten_mxfp8_quant",
     # fused_swiglu_dual_layout_mxfp4.py exports
+    "dual_layout_quant_mxfp4",
+    "fused_swiglu_bwd_dual_layout_mxfp4",
     "fused_swiglu_dual_layout_mxfp4",
 ]

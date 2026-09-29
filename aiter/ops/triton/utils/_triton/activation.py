@@ -6,6 +6,12 @@ import triton.language as tl
 
 
 @triton.jit
+def _sigmoid_exp2(x):
+    """Compute sigmoid with the exp2 formulation used by eager-compatible ops."""
+    return 1.0 / (1.0 + tl.exp2(-(x * 1.44269504089)))
+
+
+@triton.jit
 def _silu_exp2(x):
     """Compute SiLU with the exp2 formulation shared by Triton kernels."""
-    return x / (1.0 + tl.exp2(-(x * 1.44269504089)))
+    return x * _sigmoid_exp2(x)
