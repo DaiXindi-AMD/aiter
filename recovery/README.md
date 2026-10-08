@@ -1,10 +1,27 @@
 # Lumen MXFP4 AITER recovery snapshot
 
-Updated: 2026-09-29
+Updated: 2026-10-07
 
 This is a non-submission recovery snapshot for the Lumen Qwen3-8B MXFP4
 optimization work. Do not merge this branch wholesale into an AITER product
 branch.
+
+## Upstream dependency status on 2026-10-07
+
+- ROCm/aiter #5531, #5538, #5542, and #5548 are merged. #5542 landed as
+  `48b13652fd05ed6e65d82204d3e040373ff74708` and exports
+  `aiter.ops.triton.activation.silu_and_mul_backward`.
+- The merged #5542 backward is tuned and supported only on gfx950. ROCm/aiter
+  #6124 remains open at head `b207635449d945d9e445df3f0d55717c7dab3d2d` to
+  make unsupported architectures fail closed.
+- The latest checked ROCm/aiter main is
+  `b1cdc19ebf3a52b101221fee5b24a3ef7753c244`. Lumen must keep an explicit
+  non-gfx950 fallback until its pinned AITER contains #6124 or equivalent
+  guarding.
+- The remaining production AITER work is still one PR per operator:
+  `dual_layout_quant_mxfp4`, followed by
+  `dequant_hadamard_quant_mxfp4`. Preserve every existing RHT/H16 point when
+  Lumen later consumes those public APIs.
 
 ## What is preserved
 

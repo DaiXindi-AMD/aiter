@@ -1,6 +1,6 @@
 # AITER–Lumen MXFP4 kernel handoff and recovery guide
 
-Updated: 2026-09-29 (US/Central)
+Updated: 2026-10-07 (US/Central)
 
 The filename is retained because it is the original handoff entry point from
 2026-09-22. This revision supersedes the old status in that document.
@@ -29,6 +29,12 @@ The required product behavior is unchanged:
   reviewed, cleaned up, GPU-tested, and benchmarked on the new upstream base.
 - The dequant-H16 operator is preserved as a clean stacked WIP commit. It is
   not PR-ready and must not be presented as tested after the upstream rebuild.
+- AITER #5542 merged as `48b13652fd05ed6e65d82204d3e040373ff74708`.
+  Its public backward API is `aiter.ops.triton.activation.silu_and_mul_backward`
+  and its tuned support is gfx950 only.
+- AITER #6124 is the still-open architecture-guard follow-up. Until it merges,
+  Lumen must check the device architecture and fall back on non-gfx950 devices;
+  importing the public symbol alone is not a sufficient capability check.
 - The large fused SwiGLU/two-input-quant workspace is research WIP. It is
   backed up only so no source is lost and must not be submitted wholesale.
 - The Lumen commit `0f2cc903` is an integration prototype, not final submission
@@ -37,24 +43,27 @@ The required product behavior is unchanged:
 
 ## Upstream state at handoff
 
-The latest fetched `ROCm/aiter:main` at handoff is:
+The latest fetched `ROCm/aiter:main` at this update is:
 
 ```text
-475cf0f607d71010a02288094f20e97254d7d2d2
+b1cdc19ebf3a52b101221fee5b24a3ef7753c244
 ```
 
-It was fetched on 2026-09-29. The relevant upstream PR state was checked from
+It was fetched on 2026-10-07. The relevant upstream PR state was checked from
 the GitHub API:
 
 | PR | State | Merge/head commit | Relevance |
 | --- | --- | --- | --- |
 | ROCm/aiter #5531 | merged | `2887d489943fbe9a8ed5bbe0db42bc2fad4bbc1b` | canonical stochastic MXFP4 conversion/helpers |
 | ROCm/aiter #5538 | merged | `b220dbaf977d706e59e18db4eb920b7a9672d6b9` | packed FP4 logical transpose |
-| ROCm/aiter #5542 | **open** | head `74dcacab94842bac67e59b50e202ecea2b129672` | fused SiLU-and-multiply backward needed by final Lumen migration |
+| ROCm/aiter #5542 | merged | `48b13652fd05ed6e65d82204d3e040373ff74708` | fused SiLU-and-multiply backward; gfx950 only |
 | ROCm/aiter #5548 | merged | `6bb62a0978659a47176868c9cb5c0f05679ee383` | 32x32 block-scaled MXFP4 quantization |
+| ROCm/aiter #6124 | **open** | head `b207635449d945d9e445df3f0d55717c7dab3d2d` | fail-closed architecture guard for #5542 on unsupported GPUs |
 
-The three merged commits above are ancestors of `475cf0f607`. Do not tell the
-next Agent that #5542 merged unless GitHub is checked again.
+All four merged operator commits above are ancestors of `b1cdc19ebf`. #5542
+is no longer a landing blocker. The complete Lumen migration still waits for
+the two production MXFP4 operators in this guide. If #6124 has not merged when
+Lumen integration starts, keep the equivalent gfx950-only guard in Lumen.
 
 ## Remote recovery refs
 
@@ -388,7 +397,7 @@ The snapshot is research/integration source only:
 
 - do not submit the backup branch as a PR;
 - do not mix it into either production operator without a new duplicate search;
-- re-evaluate it after #5542 and the two production operators settle;
+- re-evaluate it after the two production operators settle;
 - use it to recover ideas or measured experiments, not as approved product code.
 
 ## Lumen integration state
@@ -407,7 +416,7 @@ final Lumen commit. In particular:
 - its commit author is a development-agent identity;
 - its AITER imports predate the final categorized public APIs;
 - it must not be pushed as the final submission commit;
-- its untracked #5542 integration plan is preserved in the Lumen backup ref.
+- its #5542 integration plan is preserved and updated in the Lumen backup ref.
 
 The relevant production call sites in the prototype are in
 `lumen/ops/quantize/linear.py`:
@@ -422,19 +431,21 @@ Line numbers may move; search the public function names after recovery.
 
 1. Start from the requested current `ZhangDanyang-AMD/Lumen:main`.
 2. Pin `third_party/aiter` to one reproducible ROCm/AITER revision containing
-   #5531, #5538, #5542, #5548, dual-layout, and dequant-H16.
+   #5531, #5538, #5542, #5548, dual-layout, and dequant-H16. Prefer a revision
+   containing #6124 after that follow-up merges.
 3. Import the final public categorized APIs, for example from
    `aiter.ops.triton.quant`; never import `_triton_kernels`.
-4. Add guarded `_probe_aiter_*()` checks and a logged fallback. During testing,
-   prove the AITER path actually executed so fallback cannot hide a failure.
+4. Add guarded `_probe_aiter_*()` checks, an explicit gfx950 capability check,
+   and a logged fallback. During testing, prove the AITER path actually
+   executed so fallback cannot hide a failure.
 5. Preserve the original RHT/H16 locations and stochastic-rounding choices.
 6. Build the complete Lumen migration as one contributor-authored commit.
 7. Run AITER operator tests first, then Lumen tests, then Qwen3 MXFP4 Megatron
    and FSDP/FSDP2 smoke or short training runs.
 
 The #5542 integration plan explains why Megatron directly consumes the fused
-backward while the current Hugging Face/FSDP MLP does not. Recheck it against
-the final #5542 API because that PR is still open at handoff.
+backward while the current Hugging Face/FSDP MLP does not. It has been updated
+for the merged API, gfx950-only support, and open follow-up #6124.
 
 ## GPU execution notes
 
@@ -544,13 +555,14 @@ Before opening either operator PR, confirm:
 ## Recommended continuation order
 
 1. Recover all refs and verify the exact SHAs above.
-2. Check whether upstream main advanced beyond `475cf0f607`.
+2. Check whether upstream main advanced beyond `b1cdc19ebf` and whether #6124
+   merged.
 3. Rebase and rerun the dual-layout targeted test/benchmark if required.
 4. Open the dual-layout operator PR.
 5. Complete the dequant-H16 checklist while keeping it stacked locally.
 6. After dual-layout merges, rebase the second operator alone and open its PR.
-7. Recheck and finish #5542 independently; it does not block developing these
-   two MXFP4 operators, but it blocks the complete Lumen migration target.
+7. Integrate merged #5542 through the public API on gfx950; keep a logged
+   non-gfx950 fallback until the #6124 guard is present in the pinned AITER.
 8. Rebuild one final Lumen commit and run Megatron plus FSDP/FSDP2 validation.
 
 ## Old-machine source paths
