@@ -5,6 +5,14 @@ import triton
 import triton.language as tl
 from triton.language.target_info import is_hip_cdna4
 
+from aiter.ops.triton._triton_kernels.common.mxfp4 import (
+    e2m1_v1,
+    finite_v1,
+    normalize_v1,
+    pack_codes_v1,
+    quantize_groups_v1,
+    selector_v1,
+)
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
 _static_per_tensor_quant_fp8_i8_repr = make_kernel_repr(
@@ -503,14 +511,22 @@ _dynamic_mxfp4_quant_repr = make_kernel_repr(
         "SCALING_MODE",
         "USE_SR",
         "num_warps",
+        "CONTRACT_V1",
+        "CONFIG_ID",
     ],
 )
 
 
 @triton.heuristics(
     {
-        "EVEN_M_N": lambda args: args["M"] % args["BLOCK_SIZE_M"] == 0
-        and args["N"] % (args["BLOCK_SIZE_N"] * args["NUM_ITER"]) == 0,
+        "EVEN_M_N": lambda args: (
+            False
+            if args.get("CONTRACT_V1", False)
+            else (
+                args["M"] % args["BLOCK_SIZE_M"] == 0
+                and args["N"] % (args["BLOCK_SIZE_N"] * args["NUM_ITER"]) == 0
+            )
+        ),
     }
 )
 @triton.jit(repr=_dynamic_mxfp4_quant_repr)
@@ -538,6 +554,9 @@ def _dynamic_mxfp4_quant_kernel(
     USE_SR: tl.constexpr,
     # Keep the launch warp count in the repr for traceable specializations.
     num_warps: tl.constexpr,
+    status_ptr=None,
+    CONTRACT_V1: tl.constexpr = False,
+    CONFIG_ID: tl.constexpr = 0,
 ):
     if USE_SR:
         tl.static_assert(
@@ -547,7 +566,7 @@ def _dynamic_mxfp4_quant_kernel(
 
     pid_m = tl.program_id(0)
     start_n = tl.program_id(1) * NUM_ITER
-    if USE_SR:
+    if USE_SR or CONTRACT_V1:
         loop_limit = tl.cdiv(N, BLOCK_SIZE_N)
     else:
         loop_limit = N
@@ -569,54 +588,65 @@ def _dynamic_mxfp4_quant_kernel(
         x_offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
         x_offs = x_offs_m[:, None] * stride_x_m + x_offs_n[None, :] * stride_x_n
 
-        if USE_SR:
-            if EVEN_M_N:
-                x = tl.load(x_ptr + x_offs, cache_modifier=".cg")
-            else:
-                x_mask = (x_offs_m < M)[:, None] & (x_offs_n < N)[None, :]
-                x = tl.load(
-                    x_ptr + x_offs,
-                    mask=x_mask,
-                    other=0.0,
-                    cache_modifier=".cg",
-                )
-
-            x_grouped = x.to(tl.float32).reshape(
-                BLOCK_SIZE_M, NUM_QUANT_BLOCKS, MXFP4_QUANT_BLOCK_SIZE
+        if CONTRACT_V1:
+            x_mask = (x_offs_m < M)[:, None] & (x_offs_n < N)[None, :]
+            x = tl.load(x_ptr + x_offs, mask=x_mask, other=0.0).to(tl.float32)
+            draw = philox_offset.to(tl.uint64) + (
+                x_offs_m[:, None].to(tl.uint64) * N + x_offs_n[None, :]
             )
-            amax = tl.max(tl.abs(x_grouped), axis=-1, keep_dims=True)
-            bs_e8m0, _ = _mxfp4_scale_from_amax(amax)
-            bs_e8m0 = bs_e8m0.reshape(BLOCK_SIZE_M, NUM_QUANT_BLOCKS)
-            random_words = _mxfp4_sr_random_words(
-                x_offs_m,
-                pid_n,
-                N,
-                philox_seed,
-                philox_offset,
-                BLOCK_SIZE_M=BLOCK_SIZE_M,
-                BLOCK_SIZE_N=BLOCK_SIZE_N,
+            out_tensor, bs_e8m0, poison = quantize_groups_v1(
+                x, draw, philox_seed, USE_SR, BLOCK_SIZE_M, BLOCK_SIZE_N
             )
-            out_tensor = _mxfp4_sr_pack(
-                x,
-                bs_e8m0,
-                random_words,
-                BLOCK_SIZE_M=BLOCK_SIZE_M,
-                BLOCK_SIZE_N=BLOCK_SIZE_N,
-                MXFP4_QUANT_BLOCK_SIZE=MXFP4_QUANT_BLOCK_SIZE,
-            )
+            bad = tl.sum(tl.sum(poison.to(tl.int32), 1), 0) != 0
+            tl.atomic_or(status_ptr, bad.to(tl.int32), sem="relaxed", scope="gpu")
         else:
-            if EVEN_M_N:
-                x = tl.load(x_ptr + x_offs, cache_modifier=".cg").to(tl.float32)
-            else:
-                x_mask = (x_offs_m < M)[:, None] & (x_offs_n < N)[None, :]
-                x = tl.load(x_ptr + x_offs, mask=x_mask, cache_modifier=".cg").to(
-                    tl.float32
+            if USE_SR:
+                if EVEN_M_N:
+                    x = tl.load(x_ptr + x_offs, cache_modifier=".cg")
+                else:
+                    x_mask = (x_offs_m < M)[:, None] & (x_offs_n < N)[None, :]
+                    x = tl.load(
+                        x_ptr + x_offs,
+                        mask=x_mask,
+                        other=0.0,
+                        cache_modifier=".cg",
+                    )
+
+                x_grouped = x.to(tl.float32).reshape(
+                    BLOCK_SIZE_M, NUM_QUANT_BLOCKS, MXFP4_QUANT_BLOCK_SIZE
                 )
+                amax = tl.max(tl.abs(x_grouped), axis=-1, keep_dims=True)
+                bs_e8m0, _ = _mxfp4_scale_from_amax(amax)
+                bs_e8m0 = bs_e8m0.reshape(BLOCK_SIZE_M, NUM_QUANT_BLOCKS)
+                random_words = _mxfp4_sr_random_words(
+                    x_offs_m,
+                    pid_n,
+                    N,
+                    philox_seed,
+                    philox_offset,
+                    BLOCK_SIZE_M=BLOCK_SIZE_M,
+                    BLOCK_SIZE_N=BLOCK_SIZE_N,
+                )
+                out_tensor = _mxfp4_sr_pack(
+                    x,
+                    bs_e8m0,
+                    random_words,
+                    BLOCK_SIZE_M=BLOCK_SIZE_M,
+                    BLOCK_SIZE_N=BLOCK_SIZE_N,
+                    MXFP4_QUANT_BLOCK_SIZE=MXFP4_QUANT_BLOCK_SIZE,
+                )
+            else:
+                if EVEN_M_N:
+                    x = tl.load(x_ptr + x_offs, cache_modifier=".cg").to(tl.float32)
+                else:
+                    x_mask = (x_offs_m < M)[:, None] & (x_offs_n < N)[None, :]
+                    x = tl.load(x_ptr + x_offs, mask=x_mask, cache_modifier=".cg").to(
+                        tl.float32
+                    )
 
-            out_tensor, bs_e8m0 = _mxfp4_quant_op(
-                x, BLOCK_SIZE_N, BLOCK_SIZE_M, MXFP4_QUANT_BLOCK_SIZE
-            )
-
+                out_tensor, bs_e8m0 = _mxfp4_quant_op(
+                    x, BLOCK_SIZE_N, BLOCK_SIZE_M, MXFP4_QUANT_BLOCK_SIZE
+                )
         out_offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
         out_offs_n = pid_n * BLOCK_SIZE_N // 2 + tl.arange(0, BLOCK_SIZE_N // 2)
         out_offs = (
@@ -642,6 +672,8 @@ _dynamic_mxfp4_quant_blockscale_repr = make_kernel_repr(
     "_dynamic_mxfp4_quant_blockscale_kernel",
     [
         "BLOCK_SIZE",
+        "CONTRACT_V1",
+        "CONFIG_ID",
     ],
 )
 
@@ -658,6 +690,9 @@ def _dynamic_mxfp4_quant_blockscale_kernel(
     stride_bs_m_in,
     stride_bs_n_in,
     BLOCK_SIZE: tl.constexpr,
+    status_ptr=None,
+    CONTRACT_V1: tl.constexpr = False,
+    CONFIG_ID: tl.constexpr = 0,
 ):
     """Quantize one 32x32 input tile with one shared E8M0 scale."""
     tl.static_assert(BLOCK_SIZE == 32)
@@ -679,21 +714,32 @@ def _dynamic_mxfp4_quant_blockscale_kernel(
         cache_modifier=".cg",
     ).to(tl.float32)
 
-    row_amax = tl.max(tl.abs(x), axis=1)
-    tile_amax = tl.max(row_amax, axis=0)
-    bs_e8m0, quant_scale = _mxfp4_scale_from_amax(tile_amax)
+    if CONTRACT_V1:
+        poison = tl.sum(tl.sum((~finite_v1(x)).to(tl.int32), 1), 0) != 0
+        safe = tl.where(finite_v1(x), x, 0.0)
+        amax = tl.max(tl.max(tl.abs(safe), 1), 0)
+        raw = selector_v1(amax)
+        normalized = normalize_v1(safe, raw)
+        codes = e2m1_v1(normalized, tl.full((32, 32), 0, tl.uint32), False)
+        x_fp4 = pack_codes_v1(tl.where(poison, 0, codes), 32, 32)
+        bs_e8m0 = tl.where(poison, 255, raw).to(tl.uint8)
+        tl.atomic_or(status_ptr, poison.to(tl.int32), sem="relaxed", scope="gpu")
+    else:
+        row_amax = tl.max(tl.abs(x), axis=1)
+        tile_amax = tl.max(row_amax, axis=0)
+        bs_e8m0, quant_scale = _mxfp4_scale_from_amax(tile_amax)
 
-    # Avoid the gfx950 flush of exp2(-127) by applying exp2(-126) and 0.5 separately.
-    safe_quant_scale = tl.where(bs_e8m0 == 254, tl.exp2(-126.0), quant_scale)
-    x_scaled = x * safe_quant_scale
-    x_scaled = tl.where(bs_e8m0 == 254, x_scaled * 0.5, x_scaled)
-    x_grouped = x_scaled.reshape(BLOCK_SIZE, 1, BLOCK_SIZE)
-    x_fp4 = _mxfp4_pack_op(
-        x_grouped,
-        BLOCK_SIZE,
-        BLOCK_SIZE,
-        BLOCK_SIZE,
-    )
+        # Avoid the gfx950 flush of exp2(-127) by applying exp2(-126) and 0.5 separately.
+        safe_quant_scale = tl.where(bs_e8m0 == 254, tl.exp2(-126.0), quant_scale)
+        x_scaled = x * safe_quant_scale
+        x_scaled = tl.where(bs_e8m0 == 254, x_scaled * 0.5, x_scaled)
+        x_grouped = x_scaled.reshape(BLOCK_SIZE, 1, BLOCK_SIZE)
+        x_fp4 = _mxfp4_pack_op(
+            x_grouped,
+            BLOCK_SIZE,
+            BLOCK_SIZE,
+            BLOCK_SIZE,
+        )
 
     offsets_n_packed = pid_n * (BLOCK_SIZE // 2) + tl.arange(0, BLOCK_SIZE // 2)
     tl.store(

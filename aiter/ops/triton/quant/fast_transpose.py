@@ -8,6 +8,7 @@ from aiter.ops.triton._triton_kernels.quant.fast_transpose import (
     _transpose_2d_kernel,
     _transpose_packed_fp4_kernel,
 )
+from aiter.ops.triton.utils import mxfp4_contract as contract
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 __all__ = ["fast_transpose_2d", "transpose_packed_fp4"]
@@ -111,3 +112,32 @@ def transpose_packed_fp4(data_fp4: torch.Tensor) -> torch.Tensor:
         BLOCK_N_PACKED=BLOCK_N_PACKED,
     )
     return output.view(data_fp4.dtype)
+
+
+@contract.register_contract_op(("packed", "out"), ("out",), {"H": 6, "U": 7})
+def transpose_packed_fp4_out_v1(packed, out, rows, logical_cols, H, U):
+    """Transpose nibbles into caller storage without re-quantization; return None."""
+    contract.header(H, 3, phase=contract.Phase.LAUNCH)
+    contract.integer(rows, 2, contract.SPAN_MAX, phase=contract.Phase.LAUNCH)
+    contract.integer(logical_cols, 2, contract.SPAN_MAX, phase=contract.Phase.LAUNCH)
+    if rows % 2 or logical_cols % 2:
+        contract.fail(contract.Phase.LAUNCH)
+    record = contract.ready_record(U, 3)
+    contract.check_record(record, packed.device, 0, 0)
+    source = contract.check_tensor(
+        packed, (rows, logical_cols // 2), "torch.uint8", packed.device
+    )
+    target = contract.check_tensor(
+        out, (logical_cols, rows // 2), "torch.uint8", packed.device
+    )
+    contract.disjoint((target,), (source,))
+    record.executable[
+        (triton.cdiv(rows, U[1]), triton.cdiv(logical_cols // 2, U[2]), 1)
+    ](
+        packed,
+        out,
+        rows,
+        logical_cols // 2,
+        *packed.stride(),
+        *out.stride(),
+    )

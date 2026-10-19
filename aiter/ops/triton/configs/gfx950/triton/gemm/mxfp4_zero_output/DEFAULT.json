@@ -1,0 +1,11 @@
+{
+    "any": {
+        "contract_v1": {
+            "BLOCK_M": 16,
+            "BLOCK_N": 64,
+            "num_warps": 4,
+            "num_stages": 1,
+            "waves_per_eu": 0
+        }
+    }
+}

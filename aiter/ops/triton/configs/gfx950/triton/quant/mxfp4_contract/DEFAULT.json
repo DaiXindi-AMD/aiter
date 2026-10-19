@@ -1,0 +1,29 @@
+{
+    "_dynamic_mxfp4_quant_kernel": {
+        "contract_v1": {
+            "BLOCK_M": 1,
+            "BLOCK_N": 256,
+            "NUM_ITER": 1,
+            "NUM_STAGES": 1,
+            "num_warps": 4,
+            "waves_per_eu": 0
+        }
+    },
+    "_dynamic_mxfp4_quant_blockscale_kernel": {
+        "contract_v1": {
+            "num_warps": 4,
+            "num_stages": 1,
+            "waves_per_eu": 0
+        }
+    },
+    "_transpose_packed_fp4_kernel": {
+        "contract_v1": {
+            "BLOCK_M": 32,
+            "BLOCK_N_PACKED": 16,
+            "num_warps": 4,
+            "num_stages": 1,
+            "waves_per_eu": 0,
+            "reserved_zero": 0
+        }
+    }
+}

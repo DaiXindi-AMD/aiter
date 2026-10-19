@@ -1,6 +1,8 @@
+from aiter.ops.triton.quant.dual_layout_mxfp4 import dual_layout_quant_mxfp4_out_v1
 from aiter.ops.triton.quant.fast_transpose import (
     fast_transpose_2d,
     transpose_packed_fp4,
+    transpose_packed_fp4_out_v1,
 )
 from aiter.ops.triton.quant.fused_fp8_quant import (
     calc_rows_per_block,
@@ -30,6 +32,8 @@ from aiter.ops.triton.quant.quant import (
     _nvfp4_quant_op,
     dynamic_mxfp4_quant,
     dynamic_mxfp4_quant_blockscale,
+    dynamic_mxfp4_quant_blockscale_out_v1,
+    dynamic_mxfp4_quant_out_v1,
     dynamic_mxfp8_quant,
     dynamic_mxfp8_quant_n32k4_mbn,
     dynamic_nvfp4_quant,
@@ -59,8 +63,11 @@ __all__ = [
     # fast_transpose.py exports
     "convert_from_mxfp8",
     "convert_to_mxfp8",
+    "dual_layout_quant_mxfp4_out_v1",
     "dynamic_mxfp4_quant",
     "dynamic_mxfp4_quant_blockscale",
+    "dynamic_mxfp4_quant_blockscale_out_v1",
+    "dynamic_mxfp4_quant_out_v1",
     "dynamic_mxfp8_quant",
     "dynamic_mxfp8_quant_n32k4_mbn",
     "dynamic_nvfp4_quant",
@@ -94,4 +101,5 @@ __all__ = [
     # quant.py exports
     "static_per_tensor_quant_fp8_i8",
     "transpose_packed_fp4",
+    "transpose_packed_fp4_out_v1",
 ]

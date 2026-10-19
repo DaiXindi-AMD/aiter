@@ -4,6 +4,7 @@
 import triton
 import triton.language as tl
 
+from aiter.ops.triton._triton_kernels.common.mxfp4 import finite_v1
 from aiter.ops.triton._triton_kernels.common.pid_preprocessing import (
     pid_grid,
     remap_xcd,
@@ -24,15 +25,25 @@ _gemm_afp4wfp4_repr = make_kernel_repr(
         "matrix_instr_nonkdim",
         "cache_modifier",
         "NUM_KSPLIT",
+        "CONTRACT_V1",
+        "B_SCALE_ROW_GROUP",
+        "OUTPUT_MODE",
+        "CONFIG_ID",
     ],
 )
 
 
 @triton.heuristics(
     {
-        "EVEN_K": lambda args: (args["K"] % (args["BLOCK_SIZE_K"] // 2) == 0)
-        and (args["SPLITK_BLOCK_SIZE"] % args["BLOCK_SIZE_K"] == 0)
-        and (args["K"] % (args["SPLITK_BLOCK_SIZE"] // 2) == 0),
+        "EVEN_K": lambda args: (
+            False
+            if args.get("CONTRACT_V1", False)
+            else (
+                (args["K"] % (args["BLOCK_SIZE_K"] // 2) == 0)
+                and (args["SPLITK_BLOCK_SIZE"] % args["BLOCK_SIZE_K"] == 0)
+                and (args["K"] % (args["SPLITK_BLOCK_SIZE"] // 2) == 0)
+            )
+        ),
     }
 )
 @triton.jit(repr=_gemm_afp4wfp4_repr)
@@ -69,6 +80,11 @@ def _gemm_afp4wfp4_kernel(
     waves_per_eu: tl.constexpr,
     matrix_instr_nonkdim: tl.constexpr,
     cache_modifier: tl.constexpr,
+    status_ptr=None,
+    CONTRACT_V1: tl.constexpr = False,
+    B_SCALE_ROW_GROUP: tl.constexpr = 1,
+    OUTPUT_MODE: tl.constexpr = 0,
+    CONFIG_ID: tl.constexpr = 0,
 ):
     """
     Kernel for computing the matmul C = A x B.
@@ -114,14 +130,27 @@ def _gemm_afp4wfp4_kernel(
     # We assume 32 elements along K share the same scale.
     SCALE_GROUP_SIZE: tl.constexpr = 32
 
-    if (pid_k * SPLITK_BLOCK_SIZE // 2) < K:
+    if CONTRACT_V1:
+        tl.static_assert(NUM_KSPLIT == 1)
+        healthy = tl.atomic_or(status_ptr, 0, sem="acquire", scope="gpu") == 0
+        valid_partition = healthy & (K > 0)
+    else:
+        valid_partition = (pid_k * SPLITK_BLOCK_SIZE // 2) < K
+    if valid_partition:
 
-        num_k_iter = tl.cdiv(SPLITK_BLOCK_SIZE // 2, BLOCK_SIZE_K // 2)
+        if CONTRACT_V1:
+            num_k_iter = tl.cdiv(K, BLOCK_SIZE_K // 2)
+            start_byte = 0
+            start_scale = 0
+        else:
+            num_k_iter = tl.cdiv(SPLITK_BLOCK_SIZE // 2, BLOCK_SIZE_K // 2)
+            start_byte = pid_k * (SPLITK_BLOCK_SIZE // 2)
+            start_scale = pid_k * (SPLITK_BLOCK_SIZE // SCALE_GROUP_SIZE)
 
         # Create pointers for first block of A and B input matrices
         # The BLOCK sizes are of the elements and in fp4 we pack 2 per uint8 container.
         offs_k = tl.arange(0, BLOCK_SIZE_K // 2)
-        offs_k_split = pid_k * (SPLITK_BLOCK_SIZE // 2) + offs_k
+        offs_k_split = start_byte + offs_k
         offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
         offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
         a_ptrs = a_ptr + (
@@ -131,21 +160,28 @@ def _gemm_afp4wfp4_kernel(
             offs_k_split[:, None] * stride_bk + offs_bn[None, :] * stride_bn
         )
         # Create pointers for the first block of A and B scales
-        offs_ks = (pid_k * (SPLITK_BLOCK_SIZE // SCALE_GROUP_SIZE)) + tl.arange(
-            0, BLOCK_SIZE_K // SCALE_GROUP_SIZE
-        )
+        offs_ks = start_scale + tl.arange(0, BLOCK_SIZE_K // SCALE_GROUP_SIZE)
         a_scale_ptrs = (
             a_scales_ptr + offs_am[:, None] * stride_asm + offs_ks[None, :] * stride_ask
         )
         # B scales are N x K even though B operand is K x N.
         b_scale_ptrs = (
-            b_scales_ptr + offs_bn[:, None] * stride_bsn + offs_ks[None, :] * stride_bsk
+            b_scales_ptr
+            + (offs_bn[:, None] // B_SCALE_ROW_GROUP) * stride_bsn
+            + offs_ks[None, :] * stride_bsk
         )
 
         accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
         offs_scale_k = tl.arange(0, BLOCK_SIZE_K // SCALE_GROUP_SIZE)
 
-        for k in range(pid_k * num_k_iter, (pid_k + 1) * num_k_iter):
+        bad = tl.full((), False, tl.int1)
+        if CONTRACT_V1:
+            loop_start = 0
+            loop_end = num_k_iter
+        else:
+            loop_start = pid_k * num_k_iter
+            loop_end = (pid_k + 1) * num_k_iter
+        for k in range(loop_start, loop_end):
             # Load scales, masking OOB when K is not aligned to BLOCK_SIZE_K.
             # OOB scales could contain 0xFF (NaN in e8m0) which propagates
             # through dot_scaled even when the corresponding data is zero.
@@ -180,17 +216,23 @@ def _gemm_afp4wfp4_kernel(
                     cache_modifier=cache_modifier,
                 )
 
+            if CONTRACT_V1:
+                bad = bad | (tl.sum(tl.sum((a_scales == 255).to(tl.int32), 1), 0) != 0)
+                bad = bad | (tl.sum(tl.sum((b_scales == 255).to(tl.int32), 1), 0) != 0)
             accumulator = tl.dot_scaled(
                 a, a_scales, "e2m1", b, b_scales, "e2m1", accumulator
             )
+
+            if CONTRACT_V1:
+                bad = bad | (
+                    tl.sum(tl.sum((~finite_v1(accumulator)).to(tl.int32), 1), 0) != 0
+                )
 
             # Advance the ptrs to the next K block.
             a_ptrs += (BLOCK_SIZE_K // 2) * stride_ak
             b_ptrs += (BLOCK_SIZE_K // 2) * stride_bk
             a_scale_ptrs += (BLOCK_SIZE_K // SCALE_GROUP_SIZE) * stride_ask
             b_scale_ptrs += (BLOCK_SIZE_K // SCALE_GROUP_SIZE) * stride_bsk
-
-        c = accumulator.to(c_ptr.type.element_ty)
 
         # Write back the block of the output matrix C with masks.
         offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M).to(tl.int64)
@@ -199,10 +241,28 @@ def _gemm_afp4wfp4_kernel(
             c_ptr
             + stride_cm * offs_cm[:, None]
             + stride_cn * offs_cn[None, :]
-            + pid_k * stride_ck
+            + (0 if CONTRACT_V1 else pid_k * stride_ck)
         )
         c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
-        tl.store(c_ptrs, c, mask=c_mask)
+        if CONTRACT_V1:
+            if OUTPUT_MODE == 1:
+                old = tl.load(c_ptrs, mask=c_mask, other=0.0).to(tl.float32)
+                bad = bad | (
+                    tl.sum(tl.sum((c_mask & ~finite_v1(old)).to(tl.int32), 1), 0) != 0
+                )
+                accumulator = old + accumulator
+            c = accumulator.to(c_ptr.type.element_ty, fp_downcast_rounding="rtne")
+            bad = bad | (
+                tl.sum(
+                    tl.sum((c_mask & ~finite_v1(c.to(tl.float32))).to(tl.int32), 1), 0
+                )
+                != 0
+            )
+            tl.atomic_or(status_ptr, tl.where(bad, 4, 0), sem="relaxed", scope="gpu")
+            tl.store(c_ptrs, c, mask=c_mask & ~bad)
+        else:
+            c = accumulator.to(c_ptr.type.element_ty)
+            tl.store(c_ptrs, c, mask=c_mask)
 
 
 _gemm_afp4wfp4_preshuffle_scales_repr = make_kernel_repr(

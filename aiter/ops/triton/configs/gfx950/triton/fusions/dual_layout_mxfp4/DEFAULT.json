@@ -1,0 +1,11 @@
+{
+    "_dual_layout_quant_mxfp4_kernel": {
+        "num_warps": 4,
+        "num_stages": 1,
+        "contract_v1": {
+            "num_warps": 4,
+            "num_stages": 1,
+            "waves_per_eu": 0
+        }
+    }
+}

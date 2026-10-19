@@ -20,6 +20,7 @@ from aiter.ops.triton._triton_kernels.quant.quant import (
     _nvfp4_quant_op,
     _static_per_tensor_quant_fp8_i8_kernel,
 )
+from aiter.ops.triton.utils import mxfp4_contract as contract
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton.utils.quant_config_utils import get_quant_config
@@ -870,3 +871,76 @@ def dynamic_nvfp4_quant(
     )
 
     return x_fp4, blockscale_e4m3
+
+
+@contract.register_contract_op(
+    ("x", "payload_out", "scales_out", "status"),
+    ("payload_out", "scales_out", "status"),
+    {"H": 6, "R": 7, "Q": 7},
+)
+def dynamic_mxfp4_quant_out_v1(
+    x, payload_out, scales_out, status, M, C, source_dtype, rounding, H, R, Q
+):
+    """Pack row 1x32 MXFP4 into caller buffers; return None after enqueue.
+
+    Q must name a prepared Triton record. R is the element-draw wire tuple.
+    """
+    contract.header(H, 0, phase=contract.Phase.LAUNCH)
+    source = contract.primitive_source(x, M, C, source_dtype)
+    seed, base = contract.rng_words(rounding, R, M * C, phase=contract.Phase.LAUNCH)
+    record = contract.ready_record(Q, 0)
+    contract.check_record(record, x.device, source_dtype, rounding)
+    payload = contract.check_tensor(payload_out, (M, C // 2), "torch.uint8", x.device)
+    scales = contract.check_tensor(scales_out, (M, C // 32), "torch.uint8", x.device)
+    state = contract.status_metadata(status, x.device)
+    contract.disjoint((payload, scales, state), (source,))
+    if M == 0:
+        return
+    _, bm, bn, iterations, _, _, _ = Q
+    grid = (triton.cdiv(M, bm), triton.cdiv(C, bn * iterations), 1)
+    record.executable[grid](
+        x,
+        payload_out,
+        scales_out,
+        *x.stride(),
+        *payload_out.stride(),
+        *scales_out.stride(),
+        M,
+        C,
+        seed,
+        base,
+        status,
+    )
+    return
+
+
+@contract.register_contract_op(
+    ("w", "payload_out", "scales_out", "status"),
+    ("payload_out", "scales_out", "status"),
+    {"H": 6, "B": 4},
+)
+def dynamic_mxfp4_quant_blockscale_out_v1(
+    w, payload_out, scales_out, status, N, K, source_dtype, H, B
+):
+    """Pack S1024 weights into caller buffers; source and outputs cannot alias."""
+    contract.header(H, 1, phase=contract.Phase.LAUNCH)
+    source = contract.primitive_source(w, N, K, source_dtype)
+    if N == 0 or N % 32:
+        contract.fail(contract.Phase.LAUNCH)
+    record = contract.ready_record(B, 1)
+    contract.check_record(record, w.device, source_dtype, 0)
+    payload = contract.check_tensor(payload_out, (N, K // 2), "torch.uint8", w.device)
+    scales = contract.check_tensor(
+        scales_out, (N // 32, K // 32), "torch.uint8", w.device
+    )
+    state = contract.status_metadata(status, w.device)
+    contract.disjoint((payload, scales, state), (source,))
+    record.executable[(N // 32, K // 32, 1)](
+        w,
+        payload_out,
+        scales_out,
+        *w.stride(),
+        *payload_out.stride(),
+        *scales_out.stride(),
+        status,
+    )
