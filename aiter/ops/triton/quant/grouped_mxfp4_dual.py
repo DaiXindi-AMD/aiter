@@ -24,11 +24,19 @@ from aiter.ops.triton.utils.mxfp4_wgrad import (
     validate_mxfp4_wgrad_metadata,
 )
 
+try:
+    from aiter.ops.triton._gluon_kernels.gfx950.quant.grouped_mxfp4_dual import (
+        _grouped_mxfp4_dual_v3_gluon_kernel,
+    )
+except ImportError:
+    _grouped_mxfp4_dual_v3_gluon_kernel = None
+
 __all__ = [
     "quantize_grouped_mxfp4_colwise_async",
     "quantize_grouped_mxfp4_concurrent",
     "quantize_grouped_mxfp4_dual",
     "quantize_grouped_mxfp4_dual_v2",
+    "quantize_grouped_mxfp4_dual_v3",
 ]
 
 _SIDE_STREAMS = {}
@@ -100,9 +108,9 @@ def _validate_dual_inputs(x, metadata):
     validate_mxfp4_wgrad_metadata(metadata, metadata.counts, x.device, 32)
 
 
-def _load_dual_config(config_name, device):
+def _load_dual_config(config_name, device, backend="triton"):
     with torch.cuda.device(device):
-        directory = resolve_config_dir("quant", config_name, backend="triton")
+        directory = resolve_config_dir("quant", config_name, backend=backend)
     return load_config_json(os.path.join(directory, "DEFAULT.json"))
 
 
@@ -147,12 +155,20 @@ def quantize_grouped_mxfp4_dual(x, metadata):
     """Return rowwise GEMM operands and a metadata-bound columnwise Wgrad pack.
 
     Set ``AITER_GROUPED_MXFP4_DUAL_V2=1`` to use the guarded gfx950 prototype.
-    The default path preserves the original two-dimensional launch.
+    Set ``AITER_GROUPED_MXFP4_DUAL_V3=1`` to use the LDS-staged Gluon candidate.
+    Both candidates are default-off.
     """
-    mode = os.environ.get("AITER_GROUPED_MXFP4_DUAL_V2", "0")
-    if mode not in ("0", "1"):
+    v2 = os.environ.get("AITER_GROUPED_MXFP4_DUAL_V2", "0")
+    v3 = os.environ.get("AITER_GROUPED_MXFP4_DUAL_V3", "0")
+    if v2 not in ("0", "1"):
         raise ValueError("AITER_GROUPED_MXFP4_DUAL_V2 must be 0 or 1")
-    if mode == "1":
+    if v3 not in ("0", "1"):
+        raise ValueError("AITER_GROUPED_MXFP4_DUAL_V3 must be 0 or 1")
+    if v2 == "1" and v3 == "1":
+        raise ValueError("select only one grouped MXFP4 dual candidate")
+    if v3 == "1":
+        return quantize_grouped_mxfp4_dual_v3(x, metadata)
+    if v2 == "1":
         return quantize_grouped_mxfp4_dual_v2(x, metadata)
 
     _validate_dual_inputs(x, metadata)
@@ -237,5 +253,60 @@ def quantize_grouped_mxfp4_dual_v2(x, metadata):
             NUM_XCDS=cfg["NUM_XCDS"],
             XCD_CHUNK=cfg["XCD_CHUNK"],
             USE_ASM=cfg["USE_ASM"],
+        )
+    return _wrap_dual_outputs(x, metadata, outputs)
+
+
+def quantize_grouped_mxfp4_dual_v3(x, metadata):
+    """Run one gfx950 Gluon launch with an LDS-staged 64x256 BF16 tile.
+
+    The input is finite contiguous BF16 ``[R,F]``. Expert rows use 256-row
+    padding. The return value is byte-compatible with the default dual producer.
+    """
+    _validate_dual_inputs(x, metadata)
+    if get_arch() != "gfx950":
+        raise ValueError("grouped MXFP4 dual v3 supports gfx950 only")
+    if _grouped_mxfp4_dual_v3_gluon_kernel is None:
+        raise NotImplementedError("grouped MXFP4 dual v3 requires Gluon")
+    cfg = _load_dual_config("GROUPED-MXFP4-DUAL-V3", x.device, backend="gluon")
+    bt, bf = _validate_dual_tile(cfg, metadata)
+    if metadata.pad_multiple != cfg["PAD_MULTIPLE"]:
+        raise ValueError("grouped MXFP4 dual v3 requires configured expert padding")
+    if x.shape[1] not in cfg["SUPPORTED_FEATURES"]:
+        raise ValueError("grouped MXFP4 dual v3 does not support this feature size")
+
+    outputs = _allocate_dual_outputs(x, metadata)
+    row_payload, row_scales, col_payload, col_scales = outputs
+    if any(tensor.numel() * tensor.element_size() >= 2**32 for tensor in (x, *outputs)):
+        raise NotImplementedError("grouped MXFP4 dual v3 buffers must be below 4 GiB")
+    f, p = x.shape[1], metadata.padded_rows
+    grid_f = triton.cdiv(f, bf)
+    grid_t = metadata.pad_multiple // bt
+    grid_size = metadata.compact_blocks.shape[0] * grid_t * grid_f
+    if p:
+        _grouped_mxfp4_dual_v3_gluon_kernel[(grid_size,)](
+            x,
+            row_payload,
+            row_scales,
+            col_payload,
+            col_scales,
+            metadata.compact_blocks,
+            row_payload.stride(0),
+            row_scales.stride(0),
+            col_payload.stride(0),
+            col_scales.stride(0),
+            F=f,
+            PAD_MULTIPLE=metadata.pad_multiple,
+            BLOCK_SIZE_T=bt,
+            BLOCK_SIZE_F=bf,
+            GRID_F=grid_f,
+            GRID_T=grid_t,
+            GRID_SIZE=grid_size,
+            NUM_XCDS=cfg["NUM_XCDS"],
+            XCD_CHUNK=cfg["XCD_CHUNK"],
+            CONFIG_NUM_WARPS=cfg["num_warps"],
+            num_warps=cfg["num_warps"],
+            num_stages=cfg["num_stages"],
+            waves_per_eu=cfg["waves_per_eu"],
         )
     return _wrap_dual_outputs(x, metadata, outputs)

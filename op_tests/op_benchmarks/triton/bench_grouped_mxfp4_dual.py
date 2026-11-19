@@ -18,6 +18,7 @@ from aiter.ops.triton.quant.grouped_mxfp4_dual import (
     quantize_grouped_mxfp4_concurrent,
     quantize_grouped_mxfp4_dual,
     quantize_grouped_mxfp4_dual_v2,
+    quantize_grouped_mxfp4_dual_v3,
 )
 from aiter.ops.triton.quant.quant import dynamic_mxfp4_quant
 from aiter.ops.triton.utils._triton.arch_info import get_arch
@@ -63,6 +64,7 @@ def main():
     ]
     if get_arch() == "gfx950":
         providers.append(("v2", lambda: quantize_grouped_mxfp4_dual_v2(x, metadata)))
+        providers.append(("v3", lambda: quantize_grouped_mxfp4_dual_v3(x, metadata)))
     for _ in range(5):
         for _, operation in providers:
             operation()
@@ -106,6 +108,12 @@ def main():
         result["v2_median_ms"] = v2_ms
         result["v2_speedup"] = separate_ms / v2_ms
         result["v2_vs_dual"] = dual_ms / v2_ms
+    if "v3_ms" in samples:
+        v3_ms = statistics.median(samples["v3_ms"])
+        result["v3_median_ms"] = v3_ms
+        result["v3_speedup"] = separate_ms / v3_ms
+        result["v3_vs_dual"] = dual_ms / v3_ms
+        result["v3_vs_v2"] = result["v2_median_ms"] / v3_ms
     print(json.dumps(result, indent=2))
 
 

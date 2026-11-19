@@ -18,6 +18,7 @@ from aiter.ops.triton.quant.grouped_mxfp4_dual import (
     quantize_grouped_mxfp4_concurrent,
     quantize_grouped_mxfp4_dual,
     quantize_grouped_mxfp4_dual_v2,
+    quantize_grouped_mxfp4_dual_v3,
 )
 from aiter.ops.triton.quant.quant import dynamic_mxfp4_quant
 from aiter.ops.triton.utils._triton.arch_info import get_arch
@@ -151,3 +152,54 @@ def test_grouped_mxfp4_dual_v2_rejects_unconfigured_shape():
     )
     with pytest.raises(ValueError, match="feature size"):
         quantize_grouped_mxfp4_dual_v2(x, metadata)
+
+
+@pytest.mark.parametrize("features", [768, 1536, 2048])
+@pytest.mark.parametrize("zeros", [False, True])
+def test_grouped_mxfp4_dual_v3_byte_exact(features, zeros, monkeypatch):
+    if get_arch() != "gfx950":
+        pytest.skip("gfx950 required")
+    counts = (0, 31, 33, 129, 513)
+    torch.manual_seed(97)
+    x = torch.randn((sum(counts), features), dtype=torch.bfloat16, device="cuda")
+    if zeros:
+        x.zero_()
+    metadata = prepare_mxfp4_wgrad_metadata(
+        counts, x.device, pad_multiple=256, backend="gluon"
+    )
+
+    expected = quantize_grouped_mxfp4_dual(x, metadata)
+    actual = quantize_grouped_mxfp4_dual_v3(x, metadata)
+    for result, reference in zip(
+        (*actual[0], *actual[1]), (*expected[0], *expected[1])
+    ):
+        assert torch.equal(result, reference)
+
+    monkeypatch.setenv("AITER_GROUPED_MXFP4_DUAL_V3", "1")
+    selected = quantize_grouped_mxfp4_dual(x, metadata)
+    for result, reference in zip(
+        (*selected[0], *selected[1]), (*expected[0], *expected[1])
+    ):
+        assert torch.equal(result, reference)
+
+
+def test_grouped_mxfp4_dual_v3_rejects_unconfigured_shape():
+    if get_arch() != "gfx950":
+        pytest.skip("gfx950 required")
+    x = torch.randn((32, 128), dtype=torch.bfloat16, device="cuda")
+    metadata = prepare_mxfp4_wgrad_metadata(
+        (32,), x.device, pad_multiple=256, backend="gluon"
+    )
+    with pytest.raises(ValueError, match="feature size"):
+        quantize_grouped_mxfp4_dual_v3(x, metadata)
+
+
+def test_grouped_mxfp4_dual_rejects_multiple_candidates(monkeypatch):
+    x = torch.empty((0, 128), dtype=torch.bfloat16, device="cuda")
+    metadata = prepare_mxfp4_wgrad_metadata(
+        (0,), x.device, pad_multiple=256, backend="gluon"
+    )
+    monkeypatch.setenv("AITER_GROUPED_MXFP4_DUAL_V2", "1")
+    monkeypatch.setenv("AITER_GROUPED_MXFP4_DUAL_V3", "1")
+    with pytest.raises(ValueError, match="only one"):
+        quantize_grouped_mxfp4_dual(x, metadata)

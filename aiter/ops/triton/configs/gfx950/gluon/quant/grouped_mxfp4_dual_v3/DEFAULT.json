@@ -1,0 +1,15 @@
+{
+  "BLOCK_SIZE_T": 64,
+  "BLOCK_SIZE_F": 256,
+  "PAD_MULTIPLE": 256,
+  "NUM_XCDS": 8,
+  "XCD_CHUNK": 4,
+  "SUPPORTED_FEATURES": [
+    768,
+    1536,
+    2048
+  ],
+  "num_warps": 8,
+  "num_stages": 1,
+  "waves_per_eu": 0
+}
