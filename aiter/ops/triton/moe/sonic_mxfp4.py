@@ -25,6 +25,7 @@ from aiter.ops.triton.gemm.grouped.sonic_mxfp4 import (
     prepare_expert_offsets,
     prepare_grouped_gemm_metadata,
 )
+from aiter.ops.triton.moe.sonic_swiglu_mxfp4 import fused_swiglu_mxfp4
 from aiter.ops.triton.moe.sonicmoe import activation_bwd, activation_fwd, grouped_gemm
 from aiter.ops.triton.quant.grouped_mxfp4_colwise import (
     quantize_grouped_mxfp4_colwise,
@@ -59,6 +60,13 @@ _FAMILY = {
     "mxfp4": "GEMM-SONIC-A4W4",
     "mxfp8": "GEMM-SONIC-A8W4",
 }
+
+
+def _use_fused_swiglu_producer(wgrad_mode):
+    mode = os.environ.get("SONIC_MOE_MXFP4_FUSED_PRODUCER", "0")
+    if mode not in ("0", "1"):
+        raise ValueError("SONIC_MOE_MXFP4_FUSED_PRODUCER must be 0 or 1")
+    return mode == "1" and wgrad_mode == "mxfp4"
 
 
 def _routed_weight(x, score):
@@ -167,6 +175,9 @@ class _PreRoutedMXFP4(torch.autograd.Function):
             )
         if wgrad_mode != "mxfp4":
             dual_quant_mode = "0"
+        fused_swiglu = _use_fused_swiglu_producer(wgrad_mode)
+        if fused_swiglu and dual_quant_mode == "0":
+            dual_quant_mode = "kernel"
         if wgrad_mode == "mxfp4":
             cfg, _ = check_mxfp4_wgrad_support(
                 x.device, j, h, backend=wgrad_backend, transpose_output=True
@@ -198,14 +209,20 @@ class _PreRoutedMXFP4(torch.autograd.Function):
             metadata=meta,
             quantized_activation=x_quant,
         )
-        a = activation_fwd(h1, i, "swiglu", concat_layout=True)
-        if dual_quant_mode == "kernel":
-            a_quant, a_col = quantize_grouped_mxfp4_dual(a, wgrad_meta)
+        if fused_swiglu:
+            a, a_quant, a_col = fused_swiglu_mxfp4(h1, wgrad_meta)
             a_ready = None
-        elif dual_quant_mode == "concurrent":
-            a_quant, a_col, a_ready = quantize_grouped_mxfp4_concurrent(a, wgrad_meta)
         else:
-            a_quant, a_col, a_ready = None, None, None
+            a = activation_fwd(h1, i, "swiglu", concat_layout=True)
+            if dual_quant_mode == "kernel":
+                a_quant, a_col = quantize_grouped_mxfp4_dual(a, wgrad_meta)
+                a_ready = None
+            elif dual_quant_mode == "concurrent":
+                a_quant, a_col, a_ready = quantize_grouped_mxfp4_concurrent(
+                    a, wgrad_meta
+                )
+            else:
+                a_quant, a_col, a_ready = None, None, None
         y = grouped_mxfp4_weight_gemm(
             a,
             w2_t[0],
@@ -280,7 +297,8 @@ class _PreRoutedMXFP4(torch.autograd.Function):
                     dh_ready,
                     dy_ready,
                 ):
-                    current.wait_event(ready)
+                    if ready is not None:
+                        current.wait_event(ready)
             elif ctx.dual_quant_mode == "kernel":
                 dy_col = quantize_grouped_mxfp4_colwise(dy, ctx.wgrad_meta)
                 dw1_quant = (ctx.wgrad_xp, dh_col)
@@ -429,7 +447,11 @@ def moe_pre_routed_a4w4(
     main_grads=None,
     wgrad_backend="triton",
 ):
-    """A4W4 F/D; optional native Wgrad adds into two FP32 weight-shaped buffers."""
+    """A4W4 F/D; optional native Wgrad adds into two FP32 weight-shaped buffers.
+
+    ``SONIC_MOE_MXFP4_FUSED_PRODUCER=1`` fuses SwiGLU and both activation packs
+    for native Wgrad. The default is the existing separate activation path.
+    """
     return _pre_routed_mxfp4(
         x,
         scores,
