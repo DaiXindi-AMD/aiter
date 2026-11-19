@@ -278,6 +278,7 @@ class _PreRoutedMXFP4(torch.autograd.Function):
                     ctx.wgrad_x_ready,
                     ctx.wgrad_a_ready,
                     dh_ready,
+                    dy_ready,
                 ):
                     current.wait_event(ready)
             elif ctx.dual_quant_mode == "kernel":
@@ -300,8 +301,6 @@ class _PreRoutedMXFP4(torch.autograd.Function):
                 transpose_output=True,
                 backend=ctx.wgrad_backend,
             )
-            if dy_ready is not None:
-                current.wait_event(dy_ready)
             dw2 = grouped_mxfp4_wgrad(
                 a,
                 dy,

@@ -44,7 +44,11 @@ def _side_stream(device):
 
 
 def quantize_grouped_mxfp4_colwise_async(x, metadata):
-    """Launch columnwise quant on a side stream and return (pack, ready_event)."""
+    """Launch columnwise quant on a side stream and return (pack, ready_event).
+
+    The caller must wait for the event on the launch stream before it uses the
+    pack. The wrapper records both streams for allocator-safe tensor lifetimes.
+    """
     current = torch.cuda.current_stream(x.device)
     side = _side_stream(x.device)
     side.wait_stream(current)
@@ -52,6 +56,15 @@ def quantize_grouped_mxfp4_colwise_async(x, metadata):
         col = quantize_grouped_mxfp4_colwise(x, metadata)
         ready = torch.cuda.Event()
         ready.record(side)
+    for tensor in (
+        x,
+        metadata.real_offsets,
+        metadata.padded_offsets,
+        metadata.prep_blocks,
+    ):
+        tensor.record_stream(side)
+    for tensor in col:
+        tensor.record_stream(current)
     return col, ready
 
 
