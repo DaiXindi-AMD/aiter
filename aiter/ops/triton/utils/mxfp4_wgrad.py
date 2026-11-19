@@ -19,6 +19,7 @@ class MXFP4WgradMetadata:
     real_offsets: torch.Tensor
     padded_offsets: torch.Tensor
     prep_blocks: torch.Tensor
+    compact_blocks: torch.Tensor
     storage_base: int
     tensor_versions: tuple[int, ...]
 
@@ -85,20 +86,35 @@ def build_mxfp4_wgrad_metadata(counts, device, pad_multiple):
     counts = normalize_counts(counts)
     if type(pad_multiple) is not int or pad_multiple <= 0 or pad_multiple % 32:
         raise ValueError("pad_multiple must be a positive multiple of 32")
-    real, padded, blocks = [0], [0], []
+    real, padded, blocks, compact = [0], [0], [], []
     for expert, count in enumerate(counts):
+        real_start, padded_start = real[-1], padded[-1]
         length = ((count + pad_multiple - 1) // pad_multiple) * pad_multiple
-        real.append(real[-1] + count)
-        padded.append(padded[-1] + length)
-        blocks.extend((expert, i) for i in range(length // pad_multiple))
+        real.append(real_start + count)
+        padded.append(padded_start + length)
+        for index in range(length // pad_multiple):
+            local = index * pad_multiple
+            blocks.append((expert, index))
+            compact.append(
+                (real_start + local, real_start + count, padded_start + local)
+            )
     if padded[-1] > 2**31 - 1:
         raise ValueError("padded token count exceeds int32 metadata")
-    flat = real + padded + [v for pair in blocks for v in pair]
+    pairs = [v for pair in blocks for v in pair]
+    routes = [v for route in compact for v in route]
+    flat = real + padded + pairs + routes
     # Keep version counters even when the caller is in inference_mode.
     with torch.inference_mode(False):
         data = torch.tensor(flat, dtype=torch.int32, device=device)
         n = len(real)
-        tensors = (data[:n], data[n : 2 * n], data[2 * n :].reshape(-1, 2))
+        block_data = data[2 * n : 2 * n + len(pairs)]
+        compact_data = data[2 * n + len(pairs) :]
+        tensors = (
+            data[:n],
+            data[n : 2 * n],
+            block_data.reshape(-1, 2),
+            compact_data.reshape(-1, 3),
+        )
     return MXFP4WgradMetadata(
         counts,
         pad_multiple,
@@ -129,6 +145,11 @@ def validate_mxfp4_wgrad_metadata(metadata, counts, device, block_k):
         (metadata.real_offsets, (e + 1,), 0),
         (metadata.padded_offsets, (e + 1,), e + 1),
         (metadata.prep_blocks, (padded // pad, 2), 2 * (e + 1)),
+        (
+            metadata.compact_blocks,
+            (padded // pad, 3),
+            2 * (e + 1) + 2 * (padded // pad),
+        ),
     )
     for (tensor, shape, offset), version in zip(specs, metadata.tensor_versions):
         if (

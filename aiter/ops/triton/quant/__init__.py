@@ -26,6 +26,10 @@ from aiter.ops.triton.quant.fused_mxfp8_quant import (
     fused_flatten_mxfp8_quant,
     fused_rms_mxfp8_quant,
 )
+from aiter.ops.triton.quant.grouped_mxfp4_dual import (
+    quantize_grouped_mxfp4_dual,
+    quantize_grouped_mxfp4_dual_v2,
+)
 from aiter.ops.triton.quant.quant import (
     _mxfp4_quant_op,
     _mxfp8_quant_op,
@@ -97,6 +101,8 @@ __all__ = [
     "quant_fp8_blockwise_for_act_grad",
     "quant_fp8_blockwise_for_weight",
     "quant_fp8_blockwise_segment_m",
+    "quantize_grouped_mxfp4_dual",
+    "quantize_grouped_mxfp4_dual_v2",
     "requant_fp8_row_to_col",
     # quant.py exports
     "static_per_tensor_quant_fp8_i8",

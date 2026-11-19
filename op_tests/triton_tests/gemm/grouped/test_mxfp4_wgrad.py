@@ -155,7 +155,9 @@ def test_mxfp4_wgrad_rejects_stale_bound_pack():
     assert torch.all(out == 3.0)
 
 
-@pytest.mark.parametrize("field", ["real_offsets", "padded_offsets", "prep_blocks"])
+@pytest.mark.parametrize(
+    "field", ["real_offsets", "padded_offsets", "prep_blocks", "compact_blocks"]
+)
 def test_mxfp4_wgrad_rejects_metadata_corruption(field):
     from dataclasses import replace
 
