@@ -5,6 +5,9 @@
 import triton
 import triton.language as tl
 
+from aiter.ops.triton._triton_kernels.common.pid_preprocessing import (
+    remap_xcd_chunked,
+)
 from aiter.ops.triton._triton_kernels.quant.quant import _mxfp4_quant_op
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
@@ -17,6 +20,12 @@ _dual_repr = make_kernel_repr(
         "BLOCK_SIZE_F",
         "CONFIG_NUM_WARPS",
         "CONFIG_NUM_STAGES",
+        "FLAT_GRID",
+        "GRID_F",
+        "GRID_SIZE",
+        "NUM_XCDS",
+        "XCD_CHUNK",
+        "USE_ASM",
     ],
 )
 
@@ -49,18 +58,35 @@ def _grouped_mxfp4_dual_kernel(
     BLOCK_SIZE_F: tl.constexpr,
     CONFIG_NUM_WARPS: tl.constexpr,
     CONFIG_NUM_STAGES: tl.constexpr,
+    GRID_F: tl.constexpr = 1,
+    GRID_SIZE: tl.constexpr = 1,
+    FLAT_GRID: tl.constexpr = False,
+    NUM_XCDS: tl.constexpr = 1,
+    XCD_CHUNK: tl.constexpr = 1,
+    USE_ASM: tl.constexpr = False,
 ):
     tl.static_assert(BLOCK_SIZE_T % 32 == 0)
     tl.static_assert(BLOCK_SIZE_F % 32 == 0)
     tl.static_assert(PAD_MULTIPLE % BLOCK_SIZE_T == 0)
-    block = tl.program_id(0)
-    feature_base = tl.program_id(1) * BLOCK_SIZE_F
+    if FLAT_GRID:
+        pid = remap_xcd_chunked(tl.program_id(0), GRID_SIZE, NUM_XCDS, XCD_CHUNK)
+        block = pid // GRID_F
+        feature_base = (pid % GRID_F) * BLOCK_SIZE_F
+    else:
+        block = tl.program_id(0)
+        feature_base = tl.program_id(1) * BLOCK_SIZE_F
     feature = feature_base + tl.arange(0, BLOCK_SIZE_F)
-    expert = tl.load(prep_blocks + block * 2).to(tl.int32)
-    local = tl.load(prep_blocks + block * 2 + 1).to(tl.int64) * PAD_MULTIPLE
-    start = tl.load(real_offsets + expert).to(tl.int64)
-    end = tl.load(real_offsets + expert + 1).to(tl.int64)
-    padded = tl.load(padded_offsets + expert).to(tl.int64)
+    if FLAT_GRID:
+        start = tl.load(prep_blocks + block * 3).to(tl.int64)
+        end = tl.load(prep_blocks + block * 3 + 1).to(tl.int64)
+        padded = tl.load(prep_blocks + block * 3 + 2).to(tl.int64)
+        local = 0
+    else:
+        expert = tl.load(prep_blocks + block * 2).to(tl.int32)
+        local = tl.load(prep_blocks + block * 2 + 1).to(tl.int64) * PAD_MULTIPLE
+        start = tl.load(real_offsets + expert).to(tl.int64)
+        end = tl.load(real_offsets + expert + 1).to(tl.int64)
+        padded = tl.load(padded_offsets + expert).to(tl.int64)
     for part in tl.static_range(PAD_MULTIPLE // BLOCK_SIZE_T):
         token = start + local + part * BLOCK_SIZE_T + tl.arange(0, BLOCK_SIZE_T)
         valid = (token[:, None] < end) & (feature[None, :] < F)
@@ -72,7 +98,7 @@ def _grouped_mxfp4_dual_kernel(
         ).to(tl.float32)
 
         row_payload, row_scales = _mxfp4_quant_op(
-            values, BLOCK_SIZE_F, BLOCK_SIZE_T, 32
+            values, BLOCK_SIZE_F, BLOCK_SIZE_T, 32, USE_ASM=USE_ASM
         )
         row_pb = feature_base // 2 + tl.arange(0, BLOCK_SIZE_F // 2)
         row_sb = feature_base // 32 + tl.arange(0, BLOCK_SIZE_F // 32)
@@ -88,7 +114,11 @@ def _grouped_mxfp4_dual_kernel(
         )
 
         col_payload, col_scales = _mxfp4_quant_op(
-            tl.trans(values), BLOCK_SIZE_T, BLOCK_SIZE_F, 32
+            tl.trans(values),
+            BLOCK_SIZE_T,
+            BLOCK_SIZE_F,
+            32,
+            USE_ASM=USE_ASM,
         )
         col_pb = (padded + local + part * BLOCK_SIZE_T) // 2 + tl.arange(
             0, BLOCK_SIZE_T // 2

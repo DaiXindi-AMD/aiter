@@ -17,8 +17,10 @@ from aiter.ops.triton.quant.grouped_mxfp4_colwise import (
 from aiter.ops.triton.quant.grouped_mxfp4_dual import (
     quantize_grouped_mxfp4_concurrent,
     quantize_grouped_mxfp4_dual,
+    quantize_grouped_mxfp4_dual_v2,
 )
 from aiter.ops.triton.quant.quant import dynamic_mxfp4_quant
+from aiter.ops.triton.utils._triton.arch_info import get_arch
 
 
 def _time(callable_):
@@ -54,16 +56,22 @@ def main():
         torch.cuda.current_stream().wait_event(ready)
         return row, col
 
+    providers = [
+        ("separate", separate),
+        ("dual", dual),
+        ("concurrent", concurrent),
+    ]
+    if get_arch() == "gfx950":
+        providers.append(("v2", lambda: quantize_grouped_mxfp4_dual_v2(x, metadata)))
     for _ in range(5):
-        separate()
-        dual()
-        concurrent()
+        for _, operation in providers:
+            operation()
     torch.cuda.synchronize()
 
-    samples = {"separate_ms": [], "dual_ms": [], "concurrent_ms": []}
+    samples = {f"{name}_ms": [] for name, _ in providers}
     last = {}
     for index in range(args.repeats):
-        arms = (("separate", separate), ("dual", dual), ("concurrent", concurrent))
+        arms = tuple(providers)
         shift = index % len(arms)
         order = arms[shift:] + arms[:shift]
         for name, operation in order:
@@ -72,7 +80,7 @@ def main():
 
     row_ref, col_ref = last["separate"]
     exact = {}
-    for name in ("dual", "concurrent"):
+    for name, _ in providers[1:]:
         row, col = last[name]
         exact[name] = all(
             torch.equal(actual, expected)
@@ -93,6 +101,11 @@ def main():
         "byte_exact": exact,
         "samples": samples,
     }
+    if "v2_ms" in samples:
+        v2_ms = statistics.median(samples["v2_ms"])
+        result["v2_median_ms"] = v2_ms
+        result["v2_speedup"] = separate_ms / v2_ms
+        result["v2_vs_dual"] = dual_ms / v2_ms
     print(json.dumps(result, indent=2))
 
 
