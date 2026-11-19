@@ -5,9 +5,7 @@
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
-from aiter.ops.triton._gluon_kernels.gfx950.quant.quant import (
-    _mxfp4_quant_op_bits,
-)
+from aiter.ops.triton._gluon_kernels.gfx950.quant.quant import _mxfp4_quant_op
 from aiter.ops.triton._triton_kernels.common.pid_preprocessing import (
     remap_xcd_chunked,
 )
@@ -102,9 +100,7 @@ def _grouped_mxfp4_dual_v3_gluon_kernel(
     )
     tile.store(values)
 
-    row_payload, row_scales = _mxfp4_quant_op_bits(
-        values, BLOCK_SIZE_F, BLOCK_SIZE_T, 32
-    )
+    row_payload, row_scales = _mxfp4_quant_op(values, BLOCK_SIZE_F, BLOCK_SIZE_T, 32)
     row_payload_t = gl.arange(
         0,
         BLOCK_SIZE_T,
@@ -158,7 +154,7 @@ def _grouped_mxfp4_dual_v3_gluon_kernel(
 
     # The LDS round trip ends the row live range before column quantization.
     col_values = gl.permute(tile.load(layout=col_source_layout), 1, 0)
-    col_payload, col_scales = _mxfp4_quant_op_bits(
+    col_payload, col_scales = _mxfp4_quant_op(
         col_values, BLOCK_SIZE_T, BLOCK_SIZE_F, 32
     )
     col_payload_f = gl.arange(
