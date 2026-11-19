@@ -121,9 +121,12 @@ def _mxfp4_quant_op_bits(
     groups = x.reshape(BLOCK_SIZE_M, NUM_QUANT_BLOCKS, MXFP4_QUANT_BLOCK_SIZE).to(
         gl.float32
     )
-    amax = gl.max(gl.abs(groups), axis=-1, keep_dims=True)
-    bs_e8m0 = mx_e8m0_scale(amax, 2).reshape(BLOCK_SIZE_M, NUM_QUANT_BLOCKS)
-    normalized = groups * gl.exp2(127.0 - bs_e8m0.to(gl.float32))[:, :, None]
+    scale_layout: gl.constexpr = gl.SliceLayout(2, groups.type.layout)
+    amax = gl.max(gl.abs(groups), axis=-1)
+    amax = gl.convert_layout(amax, scale_layout)
+    bs_e8m0 = mx_e8m0_scale(amax, 2)
+    quant_scale = gl.expand_dims(gl.exp2(127.0 - bs_e8m0.to(gl.float32)), 2)
+    normalized = groups * quant_scale
 
     magnitude = gl.minimum(gl.abs(normalized), 6.0)
     code = (magnitude > 0.25).to(gl.uint8)

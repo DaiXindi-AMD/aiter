@@ -194,6 +194,22 @@ def test_grouped_mxfp4_dual_v3_rejects_unconfigured_shape():
         quantize_grouped_mxfp4_dual_v3(x, metadata)
 
 
+def test_grouped_mxfp4_dual_v3_portable_quant_compiles():
+    if get_arch() != "gfx950":
+        pytest.skip("gfx950 required")
+    x = torch.zeros((1, 768), dtype=torch.bfloat16, device="cuda")
+    metadata = prepare_mxfp4_wgrad_metadata(
+        (1,), x.device, pad_multiple=256, backend="gluon"
+    )
+
+    expected = quantize_grouped_mxfp4_dual(x, metadata)
+    actual = quantize_grouped_mxfp4_dual_v3(x, metadata)
+    for result, reference in zip(
+        (*actual[0], *actual[1]), (*expected[0], *expected[1])
+    ):
+        assert torch.equal(result, reference)
+
+
 def test_grouped_mxfp4_dual_v3_rounding_edges():
     if get_arch() != "gfx950":
         pytest.skip("gfx950 required")
