@@ -109,6 +109,42 @@ def _mxfp4_quant_op(
     return x_fp4, bs_e8m0
 
 
+@gluon.jit
+def _mxfp4_quant_op_bits(
+    x,
+    BLOCK_SIZE_N: gl.constexpr,
+    BLOCK_SIZE_M: gl.constexpr,
+    MXFP4_QUANT_BLOCK_SIZE: gl.constexpr,
+):
+    """Quantize finite values with Gluon arithmetic and byte-exact RNE packing."""
+    NUM_QUANT_BLOCKS: gl.constexpr = BLOCK_SIZE_N // MXFP4_QUANT_BLOCK_SIZE
+    groups = x.reshape(BLOCK_SIZE_M, NUM_QUANT_BLOCKS, MXFP4_QUANT_BLOCK_SIZE).to(
+        gl.float32
+    )
+    amax = gl.max(gl.abs(groups), axis=-1, keep_dims=True)
+    bs_e8m0 = mx_e8m0_scale(amax, 2).reshape(BLOCK_SIZE_M, NUM_QUANT_BLOCKS)
+    normalized = groups * gl.exp2(127.0 - bs_e8m0.to(gl.float32))[:, :, None]
+
+    magnitude = gl.minimum(gl.abs(normalized), 6.0)
+    code = (magnitude > 0.25).to(gl.uint8)
+    code += (magnitude >= 0.75).to(gl.uint8)
+    code += (magnitude > 1.25).to(gl.uint8)
+    code += (magnitude >= 1.75).to(gl.uint8)
+    code += (magnitude > 2.5).to(gl.uint8)
+    code += (magnitude >= 3.5).to(gl.uint8)
+    code += (magnitude > 5.0).to(gl.uint8)
+    sign = (normalized.to(gl.uint32, bitcast=True) >> 28).to(gl.uint8) & 8
+    code = (code | sign).reshape(
+        BLOCK_SIZE_M,
+        NUM_QUANT_BLOCKS,
+        MXFP4_QUANT_BLOCK_SIZE // 2,
+        2,
+    )
+    low, high = gl.split(code)
+    packed = (low | (high << 4)).to(gl.uint8).reshape(BLOCK_SIZE_M, BLOCK_SIZE_N // 2)
+    return packed, bs_e8m0
+
+
 _gluon_dynamic_mxfp4_quant_kernel_gfx950_repr = make_kernel_repr(
     "gluon_dynamic_mxfp4_quant_kernel_gfx950",
     ["BLOCK_SIZE_M", "BLOCK_SIZE_N", "NUM_ITER", "NUM_STAGES", "num_warps", "EVEN_M_N"],

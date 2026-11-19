@@ -194,6 +194,63 @@ def test_grouped_mxfp4_dual_v3_rejects_unconfigured_shape():
         quantize_grouped_mxfp4_dual_v3(x, metadata)
 
 
+def test_grouped_mxfp4_dual_v3_rounding_edges():
+    if get_arch() != "gfx950":
+        pytest.skip("gfx950 required")
+    edge = torch.tensor(
+        [
+            -6.0,
+            -5.0,
+            -4.0,
+            -3.5,
+            -3.0,
+            -2.5,
+            -2.0,
+            -1.75,
+            -1.5,
+            -1.25,
+            -1.0,
+            -0.75,
+            -0.5,
+            -0.25,
+            -0.0,
+            0.0,
+            0.25,
+            0.5,
+            0.75,
+            1.0,
+            1.25,
+            1.5,
+            1.75,
+            2.0,
+            2.5,
+            3.0,
+            3.5,
+            4.0,
+            5.0,
+            6.0,
+            0.125,
+            -0.125,
+        ],
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    scale = torch.exp2(
+        (torch.arange(33, device="cuda", dtype=torch.float32) % 7) - 3
+    ).to(torch.bfloat16)
+    x = edge.repeat(33, 24) * scale[:, None]
+    metadata = prepare_mxfp4_wgrad_metadata(
+        (0, 1, 32), x.device, pad_multiple=256, backend="gluon"
+    )
+
+    expected = quantize_grouped_mxfp4_dual(x, metadata)
+    actual = quantize_grouped_mxfp4_dual_v3(x, metadata)
+    for result, reference in zip(
+        (*actual[0], *actual[1]), (*expected[0], *expected[1])
+    ):
+        assert torch.equal(result, reference)
+
+
 def test_grouped_mxfp4_dual_rejects_multiple_candidates(monkeypatch):
     x = torch.empty((0, 128), dtype=torch.bfloat16, device="cuda")
     metadata = prepare_mxfp4_wgrad_metadata(
