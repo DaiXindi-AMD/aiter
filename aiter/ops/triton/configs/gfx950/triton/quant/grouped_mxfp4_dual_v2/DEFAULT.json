@@ -4,7 +4,7 @@
   "PAD_MULTIPLE": 256,
   "NUM_XCDS": 8,
   "XCD_CHUNK": 4,
-  "USE_ASM": false,
+  "USE_ASM": true,
   "SUPPORTED_FEATURES": [
     768,
     1536,
