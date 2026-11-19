@@ -1,0 +1,6 @@
+{
+  "BLOCK_SIZE_T": 128,
+  "BLOCK_SIZE_F": 64,
+  "num_warps": 4,
+  "num_stages": 1
+}

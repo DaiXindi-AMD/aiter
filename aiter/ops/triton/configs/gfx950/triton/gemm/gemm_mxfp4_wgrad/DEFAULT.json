@@ -1,0 +1,17 @@
+{
+  "any": {
+    "BLOCK_SIZE_M": 128,
+    "BLOCK_SIZE_N": 128,
+    "BLOCK_SIZE_K": 128,
+    "GROUP_SIZE_M": 4,
+    "num_warps": 4,
+    "num_stages": 3,
+    "waves_per_eu": 0,
+    "matrix_instr_nonkdim": 16,
+    "cache_modifier": "",
+    "NUM_KSPLIT": 1,
+    "PERSISTENT": 0,
+    "GRID_MULTIPLIER": 1,
+    "ALIGNMENT_HINTS": 0
+  }
+}
