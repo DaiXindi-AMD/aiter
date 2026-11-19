@@ -105,26 +105,42 @@ def _grouped_mxfp4_dual_v3_gluon_kernel(
     row_payload, row_scales = _mxfp4_quant_op_bits(
         values, BLOCK_SIZE_F, BLOCK_SIZE_T, 32
     )
-    row_t = gl.arange(0, BLOCK_SIZE_T)
-    row_p = gl.arange(0, BLOCK_SIZE_F // 2)
-    row_s = gl.arange(0, BLOCK_SIZE_F // 32)
+    row_payload_t = gl.arange(
+        0,
+        BLOCK_SIZE_T,
+        layout=gl.SliceLayout(1, row_payload.type.layout),
+    )
+    row_payload_p = gl.arange(
+        0,
+        BLOCK_SIZE_F // 2,
+        layout=gl.SliceLayout(0, row_payload.type.layout),
+    )
     row_payload_offsets = (
-        (start + row_t[:, None]).to(gl.int64) * row_payload_stride
+        gl.expand_dims((start + row_payload_t).to(gl.int64) * row_payload_stride, 1)
         + feature_base // 2
-        + row_p[None, :]
+        + gl.expand_dims(row_payload_p, 0)
     ).to(gl.uint32)
+    row_scale_t = gl.arange(
+        0,
+        BLOCK_SIZE_T,
+        layout=gl.SliceLayout(1, row_scales.type.layout),
+    )
+    row_scale_s = gl.arange(
+        0,
+        BLOCK_SIZE_F // 32,
+        layout=gl.SliceLayout(0, row_scales.type.layout),
+    )
     row_scale_offsets = (
-        (start + row_t[:, None]).to(gl.int64) * row_scale_stride
+        gl.expand_dims((start + row_scale_t).to(gl.int64) * row_scale_stride, 1)
         + feature_base // 32
-        + row_s[None, :]
+        + gl.expand_dims(row_scale_s, 0)
     ).to(gl.uint32)
-    row_mask = start + row_t < end
     row_payload_mask = gl.expand_dims(
-        gl.convert_layout(row_mask, gl.SliceLayout(1, row_payload.type.layout)),
+        start + row_payload_t < end,
         1,
     )
     row_scale_mask = gl.expand_dims(
-        gl.convert_layout(row_mask, gl.SliceLayout(1, row_scales.type.layout)),
+        start + row_scale_t < end,
         1,
     )
     gl.amd.cdna4.buffer_store(
@@ -145,26 +161,48 @@ def _grouped_mxfp4_dual_v3_gluon_kernel(
     col_payload, col_scales = _mxfp4_quant_op_bits(
         col_values, BLOCK_SIZE_T, BLOCK_SIZE_F, 32
     )
-    col_f = gl.arange(0, BLOCK_SIZE_F)
-    col_p = gl.arange(0, BLOCK_SIZE_T // 2)
-    col_s = gl.arange(0, BLOCK_SIZE_T // 32)
+    col_payload_f = gl.arange(
+        0,
+        BLOCK_SIZE_F,
+        layout=gl.SliceLayout(1, col_payload.type.layout),
+    )
+    col_payload_p = gl.arange(
+        0,
+        BLOCK_SIZE_T // 2,
+        layout=gl.SliceLayout(0, col_payload.type.layout),
+    )
     col_payload_offsets = (
-        (feature_base + col_f[:, None]).to(gl.int64) * col_payload_stride
+        gl.expand_dims(
+            (feature_base + col_payload_f).to(gl.int64) * col_payload_stride,
+            1,
+        )
         + padded // 2
-        + col_p[None, :]
+        + gl.expand_dims(col_payload_p, 0)
     ).to(gl.uint32)
+    col_scale_f = gl.arange(
+        0,
+        BLOCK_SIZE_F,
+        layout=gl.SliceLayout(1, col_scales.type.layout),
+    )
+    col_scale_s = gl.arange(
+        0,
+        BLOCK_SIZE_T // 32,
+        layout=gl.SliceLayout(0, col_scales.type.layout),
+    )
     col_scale_offsets = (
-        (feature_base + col_f[:, None]).to(gl.int64) * col_scale_stride
+        gl.expand_dims(
+            (feature_base + col_scale_f).to(gl.int64) * col_scale_stride,
+            1,
+        )
         + padded // 32
-        + col_s[None, :]
+        + gl.expand_dims(col_scale_s, 0)
     ).to(gl.uint32)
-    col_mask = feature_base + col_f < F
     col_payload_mask = gl.expand_dims(
-        gl.convert_layout(col_mask, gl.SliceLayout(1, col_payload.type.layout)),
+        feature_base + col_payload_f < F,
         1,
     )
     col_scale_mask = gl.expand_dims(
-        gl.convert_layout(col_mask, gl.SliceLayout(1, col_scales.type.layout)),
+        feature_base + col_scale_f < F,
         1,
     )
     gl.amd.cdna4.buffer_store(
