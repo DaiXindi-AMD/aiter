@@ -301,6 +301,9 @@ class _PreRoutedMXFP4(torch.autograd.Function):
                 transpose_output=True,
                 backend=ctx.wgrad_backend,
             )
+            if ctx.dual_quant_mode == "concurrent":
+                for pack in dw1_quant:
+                    pack.record_stream(current)
             dw2 = grouped_mxfp4_wgrad(
                 a,
                 dy,
@@ -312,6 +315,9 @@ class _PreRoutedMXFP4(torch.autograd.Function):
                 transpose_output=True,
                 backend=ctx.wgrad_backend,
             )
+            if ctx.dual_quant_mode == "concurrent":
+                for pack in dw2_quant:
+                    pack.record_stream(current)
             if ctx.main_grads is not None:
                 for weight in (w1, w2):
                     if hasattr(weight, "grad_added_to_main_grad"):

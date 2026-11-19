@@ -63,8 +63,6 @@ def quantize_grouped_mxfp4_colwise_async(x, metadata):
         metadata.prep_blocks,
     ):
         tensor.record_stream(side)
-    for tensor in col:
-        tensor.record_stream(current)
     return col, ready
 
 
@@ -72,7 +70,8 @@ def quantize_grouped_mxfp4_concurrent(x, metadata):
     """Run row quant on the current stream while column quant runs on a side stream."""
     col, ready = quantize_grouped_mxfp4_colwise_async(x, metadata)
     if x.shape[0]:
-        row = dynamic_mxfp4_quant(x)
+        payload, scales = dynamic_mxfp4_quant(x)
+        row = payload, scales.contiguous()
     else:
         with torch.inference_mode(False):
             row = (

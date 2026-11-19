@@ -55,6 +55,8 @@ def test_grouped_mxfp4_dual_byte_exact(counts, features, zeros):
     )
     torch.cuda.current_stream().wait_event(ready)
     torch.cuda.synchronize()
+    assert concurrent_row[0].is_contiguous()
+    assert concurrent_row[1].is_contiguous()
     assert torch.equal(concurrent_row[0], row[0])
     assert torch.equal(concurrent_row[1], row[1])
     assert torch.equal(concurrent_col[0], col[0])
@@ -88,8 +90,8 @@ def test_grouped_mxfp4_concurrent_records_delayed_consumer_stream():
     actual_scales = torch.empty_like(col.scales)
     actual_payload.copy_(col.payload)
     actual_scales.copy_(col.scales)
+    col.record_stream(current)
 
-    old_ptrs = {col.payload.data_ptr(), col.scales.data_ptr()}
     specs = (
         (col.payload.shape, col.payload.dtype),
         (col.scales.shape, col.scales.dtype),
@@ -101,7 +103,8 @@ def test_grouped_mxfp4_concurrent_records_delayed_consumer_stream():
         recycled = [
             torch.empty(shape, dtype=dtype, device=x.device) for shape, dtype in specs
         ]
-    assert old_ptrs.isdisjoint(tensor.data_ptr() for tensor in recycled)
+        for tensor in recycled:
+            tensor.fill_(0xA5)
 
     current.synchronize()
     assert torch.equal(actual_payload, expected_payload)

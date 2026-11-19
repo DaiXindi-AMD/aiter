@@ -47,6 +47,11 @@ class MXFP4ColwisePack:
     def __len__(self):
         return 2
 
+    def record_stream(self, stream):
+        """Keep pack storage alive through work already queued on stream."""
+        self.payload.record_stream(stream)
+        self.scales.record_stream(stream)
+
 
 def tensor_version(tensor):
     """Read a host version counter; inference tensors have no counter."""
