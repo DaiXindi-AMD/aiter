@@ -4,10 +4,8 @@
 
 import torch
 
-from aiter.ops.triton._triton_kernels.moe.sonicmoe.grouped_gemm_triton import (
-    grouped_gemm,
-)
 from aiter.ops.triton.gemm.grouped.sonic_mxfp4 import prepare_expert_offsets
+from aiter.ops.triton.moe.sonicmoe import grouped_gemm
 from aiter.ops.triton.utils.mxfp4_wgrad import normalize_counts
 
 __all__ = ["grouped_bf16_wgrad"]

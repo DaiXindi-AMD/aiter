@@ -11,13 +11,6 @@ import os
 
 import torch
 
-from aiter.ops.triton._triton_kernels.moe.sonicmoe.activation_kernels import (
-    activation_bwd,
-    activation_fwd,
-)
-from aiter.ops.triton._triton_kernels.moe.sonicmoe.grouped_gemm_triton import (
-    grouped_gemm,
-)
 from aiter.ops.triton._triton_kernels.moe.sonicmoe.row_scale import row_scale_fp32
 from aiter.ops.triton.gemm.grouped.mxfp4_wgrad import (
     MXFP4_WGRAD_BACKENDS,
@@ -32,6 +25,7 @@ from aiter.ops.triton.gemm.grouped.sonic_mxfp4 import (
     prepare_expert_offsets,
     prepare_grouped_gemm_metadata,
 )
+from aiter.ops.triton.moe.sonicmoe import activation_bwd, activation_fwd, grouped_gemm
 from aiter.ops.triton.quant.grouped_mxfp4_colwise import (
     quantize_grouped_mxfp4_colwise,
 )
