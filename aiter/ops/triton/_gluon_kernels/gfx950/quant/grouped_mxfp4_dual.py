@@ -119,17 +119,25 @@ def _grouped_mxfp4_dual_v3_gluon_kernel(
         + row_s[None, :]
     ).to(gl.uint32)
     row_mask = start + row_t < end
+    row_payload_mask = gl.expand_dims(
+        gl.convert_layout(row_mask, gl.SliceLayout(1, row_payload.type.layout)),
+        1,
+    )
+    row_scale_mask = gl.expand_dims(
+        gl.convert_layout(row_mask, gl.SliceLayout(1, row_scales.type.layout)),
+        1,
+    )
     gl.amd.cdna4.buffer_store(
         row_payload,
         row_payload_ptr,
         row_payload_offsets,
-        mask=row_mask[:, None],
+        mask=row_payload_mask,
     )
     gl.amd.cdna4.buffer_store(
         row_scales,
         row_scale_ptr,
         row_scale_offsets,
-        mask=row_mask[:, None],
+        mask=row_scale_mask,
     )
 
     # The LDS round trip ends the row live range before column quantization.
@@ -151,15 +159,23 @@ def _grouped_mxfp4_dual_v3_gluon_kernel(
         + col_s[None, :]
     ).to(gl.uint32)
     col_mask = feature_base + col_f < F
+    col_payload_mask = gl.expand_dims(
+        gl.convert_layout(col_mask, gl.SliceLayout(1, col_payload.type.layout)),
+        1,
+    )
+    col_scale_mask = gl.expand_dims(
+        gl.convert_layout(col_mask, gl.SliceLayout(1, col_scales.type.layout)),
+        1,
+    )
     gl.amd.cdna4.buffer_store(
         col_payload,
         col_payload_ptr,
         col_payload_offsets,
-        mask=col_mask[:, None],
+        mask=col_payload_mask,
     )
     gl.amd.cdna4.buffer_store(
         col_scales,
         col_scale_ptr,
         col_scale_offsets,
-        mask=col_mask[:, None],
+        mask=col_scale_mask,
     )
