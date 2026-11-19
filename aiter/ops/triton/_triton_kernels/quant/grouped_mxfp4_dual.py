@@ -98,7 +98,7 @@ def _grouped_mxfp4_dual_kernel(
         ).to(tl.float32)
 
         row_payload, row_scales = _mxfp4_quant_op(
-            values, BLOCK_SIZE_F, BLOCK_SIZE_T, 32, USE_ASM=USE_ASM
+            values, BLOCK_SIZE_F, BLOCK_SIZE_T, 32
         )
         row_pb = feature_base // 2 + tl.arange(0, BLOCK_SIZE_F // 2)
         row_sb = feature_base // 32 + tl.arange(0, BLOCK_SIZE_F // 32)
@@ -114,11 +114,7 @@ def _grouped_mxfp4_dual_kernel(
         )
 
         col_payload, col_scales = _mxfp4_quant_op(
-            tl.trans(values),
-            BLOCK_SIZE_T,
-            BLOCK_SIZE_F,
-            32,
-            USE_ASM=USE_ASM,
+            tl.trans(values), BLOCK_SIZE_T, BLOCK_SIZE_F, 32
         )
         col_pb = (padded + local + part * BLOCK_SIZE_T) // 2 + tl.arange(
             0, BLOCK_SIZE_T // 2
