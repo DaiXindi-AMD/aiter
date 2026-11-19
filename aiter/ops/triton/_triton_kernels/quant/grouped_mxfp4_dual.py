@@ -8,6 +8,7 @@ import triton.language as tl
 from aiter.ops.triton._triton_kernels.common.pid_preprocessing import (
     remap_xcd_chunked,
 )
+from aiter.ops.triton._triton_kernels.moe.activations import silu
 from aiter.ops.triton._triton_kernels.quant.quant import _mxfp4_quant_op
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
@@ -26,6 +27,7 @@ _dual_repr = make_kernel_repr(
         "NUM_XCDS",
         "XCD_CHUNK",
         "USE_ASM",
+        "APPLY_SWIGLU",
     ],
 )
 
@@ -33,6 +35,8 @@ _dual_repr = make_kernel_repr(
 @triton.jit(
     repr=_dual_repr,
     do_not_specialize=[
+        "input_stride",
+        "output_stride",
         "row_payload_stride",
         "row_scale_stride",
         "col_payload_stride",
@@ -41,6 +45,7 @@ _dual_repr = make_kernel_repr(
 )
 def _grouped_mxfp4_dual_kernel(
     input_ptr,
+    output_ptr,
     row_payload_ptr,
     row_scale_ptr,
     col_payload_ptr,
@@ -48,6 +53,8 @@ def _grouped_mxfp4_dual_kernel(
     real_offsets,
     padded_offsets,
     prep_blocks,
+    input_stride,
+    output_stride,
     row_payload_stride,
     row_scale_stride,
     col_payload_stride,
@@ -64,6 +71,7 @@ def _grouped_mxfp4_dual_kernel(
     NUM_XCDS: tl.constexpr = 1,
     XCD_CHUNK: tl.constexpr = 1,
     USE_ASM: tl.constexpr = False,
+    APPLY_SWIGLU: tl.constexpr = False,
 ):
     tl.static_assert(BLOCK_SIZE_T % 32 == 0)
     tl.static_assert(BLOCK_SIZE_F % 32 == 0)
@@ -90,12 +98,34 @@ def _grouped_mxfp4_dual_kernel(
     for part in tl.static_range(PAD_MULTIPLE // BLOCK_SIZE_T):
         token = start + local + part * BLOCK_SIZE_T + tl.arange(0, BLOCK_SIZE_T)
         valid = (token[:, None] < end) & (feature[None, :] < F)
-        values = tl.load(
-            input_ptr + token[:, None] * F + feature[None, :],
-            mask=valid,
-            other=0.0,
-            cache_modifier=".cg",
-        ).to(tl.float32)
+        input_offsets = token[:, None] * input_stride + feature[None, :]
+        if APPLY_SWIGLU:
+            gate = tl.load(
+                input_ptr + input_offsets,
+                mask=valid,
+                other=0.0,
+                cache_modifier=".cg",
+            ).to(tl.float32)
+            up = tl.load(
+                input_ptr + input_offsets + F,
+                mask=valid,
+                other=0.0,
+                cache_modifier=".cg",
+            ).to(tl.float32)
+            values = (silu(gate) * up).to(tl.bfloat16)
+            tl.store(
+                output_ptr + token[:, None] * output_stride + feature[None, :],
+                values,
+                mask=valid,
+            )
+            values = values.to(tl.float32)
+        else:
+            values = tl.load(
+                input_ptr + input_offsets,
+                mask=valid,
+                other=0.0,
+                cache_modifier=".cg",
+            ).to(tl.float32)
 
         row_payload, row_scales = _mxfp4_quant_op(
             values, BLOCK_SIZE_F, BLOCK_SIZE_T, 32, USE_ASM=USE_ASM

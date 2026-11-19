@@ -33,6 +33,7 @@ from aiter.ops.triton.quant.grouped_mxfp4_dual import (
     quantize_grouped_mxfp4_colwise_async,
     quantize_grouped_mxfp4_concurrent,
     quantize_grouped_mxfp4_dual,
+    swiglu_grouped_mxfp4_dual,
 )
 
 __all__ = [
@@ -167,6 +168,14 @@ class _PreRoutedMXFP4(torch.autograd.Function):
             )
         if wgrad_mode != "mxfp4":
             dual_quant_mode = "0"
+        fused_swiglu_mode = os.environ.get("SONIC_MOE_FUSED_SWIGLU_MXFP4", "0")
+        if fused_swiglu_mode not in ("0", "1"):
+            raise ValueError("SONIC_MOE_FUSED_SWIGLU_MXFP4 must be 0 or 1")
+        use_fused_swiglu = (
+            fused_swiglu_mode == "1"
+            and dual_quant_mode == "kernel"
+            and fwd_format == "mxfp4"
+        )
         if wgrad_mode == "mxfp4":
             cfg, _ = check_mxfp4_wgrad_support(
                 x.device, j, h, backend=wgrad_backend, transpose_output=True
@@ -198,14 +207,20 @@ class _PreRoutedMXFP4(torch.autograd.Function):
             metadata=meta,
             quantized_activation=x_quant,
         )
-        a = activation_fwd(h1, i, "swiglu", concat_layout=True)
-        if dual_quant_mode == "kernel":
-            a_quant, a_col = quantize_grouped_mxfp4_dual(a, wgrad_meta)
+        if use_fused_swiglu:
+            a, a_quant, a_col = swiglu_grouped_mxfp4_dual(h1, wgrad_meta)
             a_ready = None
-        elif dual_quant_mode == "concurrent":
-            a_quant, a_col, a_ready = quantize_grouped_mxfp4_concurrent(a, wgrad_meta)
         else:
-            a_quant, a_col, a_ready = None, None, None
+            a = activation_fwd(h1, i, "swiglu", concat_layout=True)
+            if dual_quant_mode == "kernel":
+                a_quant, a_col = quantize_grouped_mxfp4_dual(a, wgrad_meta)
+                a_ready = None
+            elif dual_quant_mode == "concurrent":
+                a_quant, a_col, a_ready = quantize_grouped_mxfp4_concurrent(
+                    a, wgrad_meta
+                )
+            else:
+                a_quant, a_col, a_ready = None, None, None
         y = grouped_mxfp4_weight_gemm(
             a,
             w2_t[0],

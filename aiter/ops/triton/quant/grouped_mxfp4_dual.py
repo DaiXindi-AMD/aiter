@@ -29,6 +29,7 @@ __all__ = [
     "quantize_grouped_mxfp4_concurrent",
     "quantize_grouped_mxfp4_dual",
     "quantize_grouped_mxfp4_dual_v2",
+    "swiglu_grouped_mxfp4_dual",
 ]
 
 _SIDE_STREAMS = {}
@@ -164,6 +165,7 @@ def quantize_grouped_mxfp4_dual(x, metadata):
     if p:
         _grouped_mxfp4_dual_kernel[(metadata.prep_blocks.shape[0], triton.cdiv(f, bf))](
             x,
+            x,
             row_payload,
             row_scales,
             col_payload,
@@ -171,6 +173,8 @@ def quantize_grouped_mxfp4_dual(x, metadata):
             metadata.real_offsets,
             metadata.padded_offsets,
             metadata.prep_blocks,
+            x.stride(0),
+            0,
             row_payload.stride(0),
             row_scales.stride(0),
             col_payload.stride(0),
@@ -212,6 +216,7 @@ def quantize_grouped_mxfp4_dual_v2(x, metadata):
     if p:
         _grouped_mxfp4_dual_kernel[(grid_size,)](
             x,
+            x,
             row_payload,
             row_scales,
             col_payload,
@@ -219,6 +224,8 @@ def quantize_grouped_mxfp4_dual_v2(x, metadata):
             metadata.real_offsets,
             metadata.padded_offsets,
             metadata.compact_blocks,
+            x.stride(0),
+            0,
             row_payload.stride(0),
             row_scales.stride(0),
             col_payload.stride(0),
@@ -239,3 +246,80 @@ def quantize_grouped_mxfp4_dual_v2(x, metadata):
             USE_ASM=cfg["USE_ASM"],
         )
     return _wrap_dual_outputs(x, metadata, outputs)
+
+
+def swiglu_grouped_mxfp4_dual(h, metadata):
+    """Produce BF16 SwiGLU output plus rowwise and columnwise MXFP4 operands.
+
+    ``h`` is contiguous BF16 ``[R,2F]`` in concat gate/up layout. The returned
+    BF16 ``[R,F]`` remains the source of both quantized packs and must stay live
+    for activation backward and Wgrad. ``metadata`` defines expert padding.
+    Return ``(output, row_pair, col_pack)``. The gfx950 path supports configured
+    feature sizes and metadata padding only.
+    """
+    if (
+        h.ndim != 2
+        or not h.is_cuda
+        or h.dtype != torch.bfloat16
+        or not h.is_contiguous()
+        or h.shape[1] % 64
+    ):
+        raise ValueError("h must be contiguous CUDA BF16 [R,2F] with F divisible by 32")
+    if (
+        not isinstance(metadata, MXFP4WgradMetadata)
+        or metadata.total_rows != h.shape[0]
+    ):
+        raise ValueError("metadata must match input rows")
+    validate_mxfp4_wgrad_metadata(metadata, metadata.counts, h.device, 32)
+    if get_arch() != "gfx950":
+        raise ValueError("fused SwiGLU grouped MXFP4 dual supports gfx950 only")
+
+    cfg = _load_dual_config("SWIGLU-GROUPED-MXFP4-DUAL", h.device)
+    bt, bf = _validate_dual_tile(cfg, metadata)
+    f = h.shape[1] // 2
+    if metadata.pad_multiple != cfg["PAD_MULTIPLE"]:
+        raise ValueError("fused SwiGLU requires configured expert padding")
+    if f not in cfg["SUPPORTED_FEATURES"]:
+        raise ValueError("fused SwiGLU does not support this feature size")
+
+    with torch.inference_mode(False):
+        output = torch.empty((h.shape[0], f), dtype=h.dtype, device=h.device)
+    outputs = _allocate_dual_outputs(output, metadata)
+    row_payload, row_scales, col_payload, col_scales = outputs
+    grid_f = triton.cdiv(f, bf)
+    grid_size = metadata.compact_blocks.shape[0] * grid_f
+    if metadata.padded_rows:
+        _grouped_mxfp4_dual_kernel[(grid_size,)](
+            h,
+            output,
+            row_payload,
+            row_scales,
+            col_payload,
+            col_scales,
+            metadata.real_offsets,
+            metadata.padded_offsets,
+            metadata.compact_blocks,
+            h.stride(0),
+            output.stride(0),
+            row_payload.stride(0),
+            row_scales.stride(0),
+            col_payload.stride(0),
+            col_scales.stride(0),
+            F=f,
+            PAD_MULTIPLE=metadata.pad_multiple,
+            BLOCK_SIZE_T=bt,
+            BLOCK_SIZE_F=bf,
+            num_warps=cfg["num_warps"],
+            num_stages=cfg["num_stages"],
+            CONFIG_NUM_WARPS=cfg["num_warps"],
+            CONFIG_NUM_STAGES=cfg["num_stages"],
+            GRID_F=grid_f,
+            GRID_SIZE=grid_size,
+            FLAT_GRID=True,
+            NUM_XCDS=cfg["NUM_XCDS"],
+            XCD_CHUNK=cfg["XCD_CHUNK"],
+            USE_ASM=cfg["USE_ASM"],
+            APPLY_SWIGLU=True,
+        )
+    row, col = _wrap_dual_outputs(output, metadata, outputs)
+    return output, row, col

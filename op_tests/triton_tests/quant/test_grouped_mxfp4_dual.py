@@ -11,6 +11,7 @@ import aiter.ops.triton.quant.grouped_mxfp4_dual as dual_module
 from aiter.ops.triton.gemm.grouped.mxfp4_wgrad import (
     prepare_mxfp4_wgrad_metadata,
 )
+from aiter.ops.triton.moe.sonicmoe import activation_fwd
 from aiter.ops.triton.quant.grouped_mxfp4_colwise import (
     quantize_grouped_mxfp4_colwise,
 )
@@ -18,6 +19,7 @@ from aiter.ops.triton.quant.grouped_mxfp4_dual import (
     quantize_grouped_mxfp4_concurrent,
     quantize_grouped_mxfp4_dual,
     quantize_grouped_mxfp4_dual_v2,
+    swiglu_grouped_mxfp4_dual,
 )
 from aiter.ops.triton.quant.quant import dynamic_mxfp4_quant
 from aiter.ops.triton.utils._triton.arch_info import get_arch
@@ -151,3 +153,39 @@ def test_grouped_mxfp4_dual_v2_rejects_unconfigured_shape():
     )
     with pytest.raises(ValueError, match="feature size"):
         quantize_grouped_mxfp4_dual_v2(x, metadata)
+
+
+@pytest.mark.parametrize("zeros", [False, True])
+def test_swiglu_grouped_mxfp4_dual_qwen_e32_i768_byte_exact(zeros):
+    if get_arch() != "gfx950":
+        pytest.skip("gfx950 required")
+    counts = (0, 1, 31, 33, 129, 257, 17, 63) * 4
+    rows, features = sum(counts), 768
+    torch.manual_seed(117)
+    h = torch.randn((rows, 2 * features), dtype=torch.bfloat16, device="cuda")
+    if zeros:
+        h.zero_()
+    metadata = prepare_mxfp4_wgrad_metadata(
+        counts, h.device, pad_multiple=256, backend="gluon"
+    )
+
+    reference = activation_fwd(h, features, "swiglu", concat_layout=True)
+    row_reference, col_reference = quantize_grouped_mxfp4_dual_v2(reference, metadata)
+    output, row, col = swiglu_grouped_mxfp4_dual(h, metadata)
+
+    assert torch.equal(output, reference)
+    for result, expected in zip((*row, *col), (*row_reference, *col_reference)):
+        assert torch.equal(result, expected)
+    assert col.source is output
+    assert output.shape == (rows, features)
+
+
+def test_swiglu_grouped_mxfp4_dual_rejects_unconfigured_feature():
+    if get_arch() != "gfx950":
+        pytest.skip("gfx950 required")
+    h = torch.randn((32, 256), dtype=torch.bfloat16, device="cuda")
+    metadata = prepare_mxfp4_wgrad_metadata(
+        (32,), h.device, pad_multiple=256, backend="gluon"
+    )
+    with pytest.raises(ValueError, match="feature size"):
+        swiglu_grouped_mxfp4_dual(h, metadata)
