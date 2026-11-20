@@ -22,7 +22,6 @@ _dual_repr = make_kernel_repr(
         "CONFIG_NUM_STAGES",
         "FLAT_GRID",
         "GRID_F",
-        "GRID_SIZE",
         "NUM_XCDS",
         "XCD_CHUNK",
         "USE_ASM",
@@ -39,6 +38,7 @@ _dual_repr = make_kernel_repr(
         "col_payload_stride",
         "col_scale_stride",
         "source_rows",
+        "GRID_SIZE",
     ],
 )
 def _grouped_mxfp4_dual_kernel(
@@ -63,7 +63,7 @@ def _grouped_mxfp4_dual_kernel(
     CONFIG_NUM_WARPS: tl.constexpr,
     CONFIG_NUM_STAGES: tl.constexpr,
     GRID_F: tl.constexpr = 1,
-    GRID_SIZE: tl.constexpr = 1,
+    GRID_SIZE=1,
     FLAT_GRID: tl.constexpr = False,
     NUM_XCDS: tl.constexpr = 1,
     XCD_CHUNK: tl.constexpr = 1,
