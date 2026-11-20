@@ -153,6 +153,16 @@ def _main_grad_accumulate(weights, main_grads):
     return flags[0]
 
 
+def _resolve_dual_quant_mode(wgrad_mode):
+    """Select fused row/column quant for native MXFP4 Wgrad by default."""
+    mode = os.environ.get("SONIC_MOE_MXFP4_DUAL_QUANT", "kernel")
+    if mode == "1":
+        mode = "kernel"
+    if mode not in ("0", "kernel", "concurrent"):
+        raise ValueError("SONIC_MOE_MXFP4_DUAL_QUANT must be 0, kernel or concurrent")
+    return mode if wgrad_mode == "mxfp4" else "0"
+
+
 class _PreRoutedMXFP4(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -180,15 +190,7 @@ class _PreRoutedMXFP4(torch.autograd.Function):
             bwd_meta, _ = _metadata(
                 counts, x.device, ((i, h), (h, j)), _FAMILY[bwd_format], offsets
             )
-        dual_quant_mode = os.environ.get("SONIC_MOE_MXFP4_DUAL_QUANT", "0")
-        if dual_quant_mode == "1":
-            dual_quant_mode = "kernel"
-        if dual_quant_mode not in ("0", "kernel", "concurrent"):
-            raise ValueError(
-                "SONIC_MOE_MXFP4_DUAL_QUANT must be 0, kernel or concurrent"
-            )
-        if wgrad_mode != "mxfp4":
-            dual_quant_mode = "0"
+        dual_quant_mode = _resolve_dual_quant_mode(wgrad_mode)
         if wgrad_mode == "mxfp4":
             cfg, _ = check_mxfp4_wgrad_support(
                 x.device, j, h, backend=wgrad_backend, transpose_output=True

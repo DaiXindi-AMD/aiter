@@ -7,11 +7,20 @@ import torch
 
 from aiter.ops.triton.moe.sonic_mxfp4 import (
     _main_grad_accumulate,
+    _resolve_dual_quant_mode,
     _validate_main_grads,
     moe_pre_routed_a4w4,
 )
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+
+
+def test_native_wgrad_defaults_to_fused_dual_quant(monkeypatch):
+    monkeypatch.delenv("SONIC_MOE_MXFP4_DUAL_QUANT", raising=False)
+    assert _resolve_dual_quant_mode("mxfp4") == "kernel"
+    assert _resolve_dual_quant_mode("bf16") == "0"
+    monkeypatch.setenv("SONIC_MOE_MXFP4_DUAL_QUANT", "0")
+    assert _resolve_dual_quant_mode("mxfp4") == "0"
 
 
 def test_main_grad_first_write_then_accumulate():
