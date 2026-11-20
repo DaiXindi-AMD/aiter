@@ -155,7 +155,13 @@ def _main_grad_accumulate(weights, main_grads):
 
 def _resolve_dual_quant_mode(wgrad_mode):
     """Select fused row/column quant for native MXFP4 Wgrad by default."""
-    mode = os.environ.get("SONIC_MOE_MXFP4_DUAL_QUANT", "kernel")
+    mode = os.environ.get("SONIC_MOE_MXFP4_DUAL_QUANT")
+    if mode is None:
+        mode = (
+            "kernel"
+            if os.environ.get("AITER_GROUPED_MXFP4_DUAL_V2", "0") == "1"
+            else "0"
+        )
     if mode == "1":
         mode = "kernel"
     if mode not in ("0", "kernel", "concurrent"):

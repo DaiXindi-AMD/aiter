@@ -17,6 +17,9 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA requ
 
 def test_native_wgrad_defaults_to_fused_dual_quant(monkeypatch):
     monkeypatch.delenv("SONIC_MOE_MXFP4_DUAL_QUANT", raising=False)
+    monkeypatch.delenv("AITER_GROUPED_MXFP4_DUAL_V2", raising=False)
+    assert _resolve_dual_quant_mode("mxfp4") == "0"
+    monkeypatch.setenv("AITER_GROUPED_MXFP4_DUAL_V2", "1")
     assert _resolve_dual_quant_mode("mxfp4") == "kernel"
     assert _resolve_dual_quant_mode("bf16") == "0"
     monkeypatch.setenv("SONIC_MOE_MXFP4_DUAL_QUANT", "0")
