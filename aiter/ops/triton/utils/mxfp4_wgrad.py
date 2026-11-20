@@ -30,7 +30,7 @@ class MXFP4WgradMetadata:
 
 @dataclass(frozen=True)
 class MXFP4ColwisePack:
-    """Columnwise tensors bound to producer routing, source, and optional row map."""
+    """Columnwise tensors with producer provenance and optional owned snapshot."""
 
     payload: torch.Tensor
     scales: torch.Tensor
@@ -40,6 +40,8 @@ class MXFP4ColwisePack:
     tensor_versions: tuple[int | None, int | None]
     source_map: torch.Tensor | None = None
     source_map_version: int | None = None
+    owns_source_snapshot: bool = False
+    source_structure: tuple | None = None
 
     def __getitem__(self, index):
         return (self.payload, self.scales)[index]
@@ -89,6 +91,18 @@ def tensor_version(tensor):
         return tensor._version
     except RuntimeError:
         return None
+
+
+def tensor_structure(tensor):
+    """Return storage and layout identity without tracking tensor contents."""
+    return (
+        tensor.untyped_storage().data_ptr(),
+        tensor.storage_offset(),
+        tuple(tensor.shape),
+        tuple(tensor.stride()),
+        tensor.dtype,
+        tensor.device,
+    )
 
 
 _STATS = {

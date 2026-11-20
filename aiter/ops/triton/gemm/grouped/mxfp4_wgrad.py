@@ -19,6 +19,7 @@ from aiter.ops.triton.utils.mxfp4_wgrad import (
     build_mxfp4_wgrad_metadata,
     normalize_counts,
     record_mxfp4_wgrad_launch,
+    tensor_structure,
     tensor_version,
     validate_mxfp4_wgrad_metadata,
 )
@@ -124,10 +125,16 @@ def _validate_pack(pair, source, metadata):
         raise ValueError("quantized operand producer metadata does not match")
     if pair.source is not source:
         raise ValueError("quantized operand source tensor does not match")
-    if pair.source_version is None or tensor_version(source) != pair.source_version:
-        raise ValueError(
-            "quantized operand source was mutated or has no version counter"
-        )
+    if pair.source_version is None:
+        raise ValueError("quantized operand source has no version counter")
+    if pair.owns_source_snapshot:
+        if (
+            pair.source_structure is None
+            or tensor_structure(source) != pair.source_structure
+        ):
+            raise ValueError("quantized operand snapshot source structure changed")
+    elif tensor_version(source) != pair.source_version:
+        raise ValueError("quantized operand source was mutated")
     source_map = pair.source_map
     if source_map is None:
         if source.shape[0] != metadata.total_rows:
@@ -189,9 +196,10 @@ def grouped_mxfp4_wgrad(
     accumulate=True requires out. Empty experts overwrite with zero or retain
     their accumulated value.
 
-    quantized_operands=(X_pack,dY_pack) must be bound producer objects with the
-    same metadata and unchanged source tensors/versions. Raw storage/.data writes
-    are unsupported; these packs are single-routing-lived, not generation caches.
+    quantized_operands=(X_pack,dY_pack) must bind the same logical metadata rows.
+    Each pack can have its own map or no map. A mapped owned snapshot permits
+    source content reuse but still validates source structure and map version.
+    Raw storage/.data writes are unsupported; packs are single-routing-lived.
     Padding/tile walk come from JSON. Calls on one output require one ordered stream.
     backend selects triton or gluon without cross-backend fallback. Gluon v4
     requires BM256/BN128/BK256, eight warps, buffers below 4 GiB. No precision fallback.
@@ -253,8 +261,6 @@ def grouped_mxfp4_wgrad(
             raise ValueError("quantized_operands must be (X_pack, dY_pack)")
         xp = _validate_pack(quantized_operands[0], x, metadata)
         dyp = _validate_pack(quantized_operands[1], dy, metadata)
-        if xp.source_map is not dyp.source_map:
-            raise ValueError("quantized operand source maps do not match")
         inputs.extend((*xp, *dyp))
         for pair in (xp, dyp):
             if pair.source_map is not None:

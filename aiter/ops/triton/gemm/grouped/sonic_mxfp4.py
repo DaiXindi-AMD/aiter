@@ -21,6 +21,10 @@ from aiter.ops.triton._triton_kernels.moe.sonicmoe.grouped_gemm_triton import (
 )
 from aiter.ops.triton.quant.quant import dynamic_mxfp4_quant, dynamic_mxfp8_quant
 from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
+from aiter.ops.triton.utils.mxfp4_wgrad import (
+    MXFP4RowwisePack,
+    tensor_version,
+)
 
 __all__ = [
     "ACTIVATION_FORMATS",
@@ -167,6 +171,44 @@ def _expert_block_base(meta, n):
     return base
 
 
+def _validate_mapped_activation(pack, source):
+    if pack.source is not source:
+        raise ValueError("mapped activation source tensor does not match")
+    if pack.source_version is None or tensor_version(source) != pack.source_version:
+        raise ValueError("mapped activation source was mutated")
+    source_map = pack.source_map
+    if (
+        not isinstance(source_map, torch.Tensor)
+        or source_map.ndim != 1
+        or source_map.dtype != torch.int32
+        or source_map.device != source.device
+        or not source_map.is_contiguous()
+    ):
+        raise ValueError("mapped activation requires a contiguous int32 source map")
+    if (
+        pack.source_map_version is None
+        or tensor_version(source_map) != pack.source_map_version
+    ):
+        raise ValueError("mapped activation source map was mutated")
+    shapes = (
+        (source_map.numel(), source.shape[1] // 2),
+        (source_map.numel(), source.shape[1] // 32),
+    )
+    for tensor, shape, version in zip(pack, shapes, pack.tensor_versions):
+        if (
+            tensor.shape != shape
+            or tensor.dtype != torch.uint8
+            or tensor.device != source.device
+            or not tensor.is_contiguous()
+        ):
+            raise ValueError("invalid mapped rowwise activation pack")
+        if version is None or tensor_version(tensor) != version:
+            raise ValueError("mapped rowwise activation pack was mutated")
+    if len(pack.tensor_versions) != 2:
+        raise ValueError("mapped activation version provenance is incomplete")
+    return source_map.numel()
+
+
 def grouped_mxfp4_weight_gemm(
     x,
     payload,
@@ -187,7 +229,8 @@ def grouped_mxfp4_weight_gemm(
     ``activation_format`` selects bf16 / mxfp4 / mxfp8. ``quantize_activation=True``
     is the legacy spelling of ``activation_format="mxfp4"``.
     ``quantized_activation`` lets a caller pass an already-quantized (payload,
-    scales) pair, which avoids re-quantizing the same activation.
+    scales) pair, which avoids re-quantizing the same activation. A mapped
+    rowwise pack binds an unsorted source to expert-major quantized rows.
     ``metadata`` is a dict from :func:`prepare_grouped_gemm_metadata`; it must have
     been built with the block shape this family resolves for (n, k, e).
     """
@@ -205,7 +248,14 @@ def grouped_mxfp4_weight_gemm(
     if payload.ndim != 3:
         raise ValueError("payload must be [E,N,K/2]")
     e, n, half_k = payload.shape
-    rows, k = x.shape
+    source_rows, k = x.shape
+    mapped_activation = isinstance(quantized_activation, MXFP4RowwisePack)
+    if mapped_activation:
+        if activation_format != "mxfp4":
+            raise ValueError("mapped activation packs require activation_format=mxfp4")
+        rows = _validate_mapped_activation(quantized_activation, x)
+    else:
+        rows = source_rows
     if min(e, n, k) <= 0 or k % 32 or half_k * 2 != k:
         raise ValueError("invalid packed dimensions")
     if scales.shape != (e, n, k // 32):
@@ -230,7 +280,10 @@ def grouped_mxfp4_weight_gemm(
         or not out.is_contiguous()
     ):
         raise ValueError("out must be contiguous BF16 [R,N] on x.device")
-    if any(torch._C._overlaps(out, t) for t in (x, payload, scales)):
+    overlap_inputs = [x, payload, scales]
+    if mapped_activation:
+        overlap_inputs.extend((*quantized_activation, quantized_activation.source_map))
+    if any(torch._C._overlaps(out, t) for t in overlap_inputs):
         raise ValueError("out must not overlap any input")
     if rows == 0:
         return out

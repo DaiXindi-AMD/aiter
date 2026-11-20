@@ -21,6 +21,7 @@ from aiter.ops.triton.utils.mxfp4_wgrad import (
     MXFP4RowwisePack,
     MXFP4WgradMetadata,
     record_mxfp4_colwise_quant,
+    tensor_structure,
     tensor_version,
     validate_mxfp4_wgrad_metadata,
 )
@@ -173,6 +174,8 @@ def _wrap_dual_outputs(x, metadata, outputs, source_map=None):
         (tensor_version(col_payload), tensor_version(col_scales)),
         source_map,
         source_map_version,
+        source_map is not None,
+        tensor_structure(x),
     )
     return row_pack, col_pack
 

@@ -216,10 +216,10 @@ def test_mxfp4_wgrad_accepts_mapped_producer_packs(monkeypatch):
     counts = (0, 1, 32)
     source_map = (torch.arange(sum(counts), device="cuda") % 17).to(torch.int32)
     x = torch.randn((17, 768), dtype=torch.bfloat16, device="cuda") * 0.05
-    dy = torch.randn((17, 768), dtype=torch.bfloat16, device="cuda") * 0.08
+    dy = torch.randn((sum(counts), 768), dtype=torch.bfloat16, device="cuda") * 0.08
     metadata = prepare_mxfp4_wgrad_metadata(counts, x.device, pad_multiple=256)
     xp = quantize_grouped_mxfp4_dual_mapped(x, source_map, metadata)[1]
-    dyp = quantize_grouped_mxfp4_dual_mapped(dy, source_map, metadata)[1]
+    dyp = quantize_grouped_mxfp4_colwise(dy, metadata)
 
     out = grouped_mxfp4_wgrad(
         x,
@@ -230,39 +230,45 @@ def test_mxfp4_wgrad_accepts_mapped_producer_packs(monkeypatch):
     )
     expected = same_fp4_wgrad_reference(xp, dyp, metadata)
     torch.testing.assert_close(out, expected, rtol=2e-4, atol=2e-5)
-    distinct_map = source_map.clone()
-    distinct_dyp = quantize_grouped_mxfp4_dual_mapped(dy, distinct_map, metadata)[1]
-    with pytest.raises(ValueError, match="source maps do not match"):
-        grouped_mxfp4_wgrad(
-            x,
-            dy,
-            counts,
-            metadata=metadata,
-            quantized_operands=(xp, distinct_dyp),
-        )
 
 
-@pytest.mark.parametrize("mutated", ["source", "source_map"])
-def test_mxfp4_wgrad_rejects_mapped_pack_mutation_before_write(mutated, monkeypatch):
+def test_mxfp4_wgrad_mapped_snapshot_allows_source_reuse(monkeypatch):
     if get_arch() != "gfx950":
         pytest.skip("gfx950 required")
     monkeypatch.setenv("AITER_GROUPED_MXFP4_MAPPED", "1")
     counts = (0, 1, 32)
     source_map = (torch.arange(sum(counts), device="cuda") % 17).to(torch.int32)
     x = torch.randn((17, 768), dtype=torch.bfloat16, device="cuda")
-    dy = torch.randn((17, 768), dtype=torch.bfloat16, device="cuda")
+    dy = torch.randn((sum(counts), 768), dtype=torch.bfloat16, device="cuda")
     metadata = prepare_mxfp4_wgrad_metadata(counts, x.device, pad_multiple=256)
     xp = quantize_grouped_mxfp4_dual_mapped(x, source_map, metadata)[1]
-    dyp = quantize_grouped_mxfp4_dual_mapped(dy, source_map, metadata)[1]
-    out = torch.full((3, 768, 768), 3.0, dtype=torch.float32, device="cuda")
-    if mutated == "source":
-        x.add_(1)
-        error = "source was mutated"
-    else:
-        source_map.add_(1)
-        error = "source map was mutated"
+    dyp = quantize_grouped_mxfp4_colwise(dy, metadata)
+    expected = same_fp4_wgrad_reference(xp, dyp, metadata)
+    x.copy_(torch.randn_like(x))
+    out = grouped_mxfp4_wgrad(
+        x,
+        dy,
+        counts,
+        metadata=metadata,
+        quantized_operands=(xp, dyp),
+    )
+    torch.testing.assert_close(out, expected, rtol=2e-4, atol=2e-5)
 
-    with pytest.raises(ValueError, match=error):
+
+def test_mxfp4_wgrad_rejects_mapped_map_mutation_before_write(monkeypatch):
+    if get_arch() != "gfx950":
+        pytest.skip("gfx950 required")
+    monkeypatch.setenv("AITER_GROUPED_MXFP4_MAPPED", "1")
+    counts = (0, 1, 32)
+    source_map = (torch.arange(sum(counts), device="cuda") % 17).to(torch.int32)
+    x = torch.randn((17, 768), dtype=torch.bfloat16, device="cuda")
+    dy = torch.randn((sum(counts), 768), dtype=torch.bfloat16, device="cuda")
+    metadata = prepare_mxfp4_wgrad_metadata(counts, x.device, pad_multiple=256)
+    xp = quantize_grouped_mxfp4_dual_mapped(x, source_map, metadata)[1]
+    dyp = quantize_grouped_mxfp4_colwise(dy, metadata)
+    out = torch.full((3, 768, 768), 3.0, dtype=torch.float32, device="cuda")
+    source_map.add_(1)
+    with pytest.raises(ValueError, match="source map was mutated"):
         grouped_mxfp4_wgrad(
             x,
             dy,
