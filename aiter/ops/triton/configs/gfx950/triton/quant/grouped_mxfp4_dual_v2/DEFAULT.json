@@ -2,6 +2,10 @@
   "BLOCK_SIZE_T": 128,
   "BLOCK_SIZE_F": 64,
   "PAD_MULTIPLE": 256,
+  "SUPPORTED_PAD_MULTIPLES": [
+    128,
+    256
+  ],
   "NUM_XCDS": 8,
   "XCD_CHUNK": 4,
   "USE_ASM": true,

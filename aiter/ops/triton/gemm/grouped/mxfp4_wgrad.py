@@ -19,6 +19,7 @@ from aiter.ops.triton.utils.mxfp4_wgrad import (
     build_mxfp4_wgrad_metadata,
     normalize_counts,
     record_mxfp4_wgrad_launch,
+    tensor_structure,
     tensor_version,
     validate_mxfp4_wgrad_metadata,
 )
@@ -124,10 +125,36 @@ def _validate_pack(pair, source, metadata):
         raise ValueError("quantized operand producer metadata does not match")
     if pair.source is not source:
         raise ValueError("quantized operand source tensor does not match")
-    if pair.source_version is None or tensor_version(source) != pair.source_version:
-        raise ValueError(
-            "quantized operand source was mutated or has no version counter"
-        )
+    if pair.source_version is None:
+        raise ValueError("quantized operand source has no version counter")
+    if pair.owns_source_snapshot:
+        if (
+            pair.source_structure is None
+            or tensor_structure(source) != pair.source_structure
+        ):
+            raise ValueError("quantized operand snapshot source structure changed")
+    elif tensor_version(source) != pair.source_version:
+        raise ValueError("quantized operand source was mutated")
+    source_map = pair.source_map
+    if source_map is None:
+        if source.shape[0] != metadata.total_rows:
+            raise ValueError("unmapped quantized operand rows do not match routing")
+        if pair.source_map_version is not None:
+            raise ValueError("quantized operand map provenance is incomplete")
+    else:
+        if (
+            not isinstance(source_map, torch.Tensor)
+            or source_map.shape != (metadata.total_rows,)
+            or source_map.dtype != torch.int32
+            or source_map.device != source.device
+            or not source_map.is_contiguous()
+        ):
+            raise ValueError("invalid contiguous int32 quantized operand source map")
+        if (
+            pair.source_map_version is None
+            or tensor_version(source_map) != pair.source_map_version
+        ):
+            raise ValueError("quantized operand source map was mutated")
     shapes = (
         (source.shape[1], metadata.padded_rows // 2),
         (source.shape[1], metadata.padded_rows // 32),
@@ -162,14 +189,17 @@ def grouped_mxfp4_wgrad(
 ):
     """Compute dW[e] = dY[e].T @ X[e] with E2M1 data and independent E8M0 scales.
 
-    X[R,N] and dY[R,M] are contiguous finite CUDA BF16. Return FP32 [E,M,N],
-    or [E,N,M] with transpose_output. out is a non-overlapping contiguous FP32
-    tensor. accumulate=True requires out and adds without an intermediate cast.
-    Empty experts overwrite with zero or leave accumulation unchanged.
+    X[RX,N] and dY[RY,M] are contiguous finite CUDA BF16. Without prequantized
+    operands RX=RY=sum(counts). Mapped producer packs can bind each source to
+    an expert-major row map of length sum(counts). Return FP32 [E,M,N], or
+    [E,N,M] with transpose_output. out is non-overlapping contiguous FP32.
+    accumulate=True requires out. Empty experts overwrite with zero or retain
+    their accumulated value.
 
-    quantized_operands=(X_pack,dY_pack) must be bound producer objects with the
-    same metadata and unchanged source tensors/versions. Raw storage/.data writes
-    are unsupported; these packs are single-routing-lived, not generation caches.
+    quantized_operands=(X_pack,dY_pack) must bind the same logical metadata rows.
+    Each pack can have its own map or no map. A mapped owned snapshot permits
+    source content reuse but still validates source structure and map version.
+    Raw storage/.data writes are unsupported; packs are single-routing-lived.
     Padding/tile walk come from JSON. Calls on one output require one ordered stream.
     backend selects triton or gluon without cross-backend fallback. Gluon v4
     requires BM256/BN128/BK256, eight warps, buffers below 4 GiB. No precision fallback.
@@ -184,9 +214,9 @@ def grouped_mxfp4_wgrad(
             or not tensor.is_contiguous()
         ):
             raise ValueError("operands must be contiguous CUDA BF16 matrices")
-    if x.device != dy.device or x.shape[0] != dy.shape[0]:
-        raise ValueError("X and dY must have the same rows and device")
-    counts = normalize_counts(counts, x.shape[0])
+    if x.device != dy.device:
+        raise ValueError("X and dY must be on the same device")
+    counts = normalize_counts(counts)
     m, n, e = dy.shape[1], x.shape[1], len(counts)
     cfg, tuned = check_mxfp4_wgrad_support(
         x.device, m, n, backend=backend, transpose_output=transpose_output
@@ -194,10 +224,16 @@ def grouped_mxfp4_wgrad(
     if metadata is None:
         if quantized_operands is not None:
             raise ValueError("prequantized operands require their producer metadata")
+        if x.shape[0] != dy.shape[0] or x.shape[0] != sum(counts):
+            raise ValueError("unquantized X and dY rows must match counts")
         metadata = prepare_mxfp4_wgrad_metadata(
             counts, x.device, pad_multiple=cfg["BLOCK_SIZE_K"], backend=backend
         )
     validate_mxfp4_wgrad_metadata(metadata, counts, x.device, cfg["BLOCK_SIZE_K"])
+    if quantized_operands is None and (
+        x.shape[0] != dy.shape[0] or x.shape[0] != metadata.total_rows
+    ):
+        raise ValueError("unquantized X and dY rows must match routing")
     shape = (e, n, m) if transpose_output else (e, m, n)
     if out is None:
         if accumulate:
@@ -226,6 +262,9 @@ def grouped_mxfp4_wgrad(
         xp = _validate_pack(quantized_operands[0], x, metadata)
         dyp = _validate_pack(quantized_operands[1], dy, metadata)
         inputs.extend((*xp, *dyp))
+        for pair in (xp, dyp):
+            if pair.source_map is not None:
+                inputs.append(pair.source_map)
     if any(torch._C._overlaps(out, tensor) for tensor in inputs):
         raise ValueError("out must not overlap inputs or metadata")
     if metadata.padded_rows == 0:

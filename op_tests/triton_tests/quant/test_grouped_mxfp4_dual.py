@@ -3,6 +3,7 @@
 """Grouped dual producer matches independent row/column MXFP4 quantization."""
 
 import gc
+import weakref
 
 import pytest
 import torch
@@ -17,6 +18,7 @@ from aiter.ops.triton.quant.grouped_mxfp4_colwise import (
 from aiter.ops.triton.quant.grouped_mxfp4_dual import (
     quantize_grouped_mxfp4_concurrent,
     quantize_grouped_mxfp4_dual,
+    quantize_grouped_mxfp4_dual_mapped,
     quantize_grouped_mxfp4_dual_v2,
 )
 from aiter.ops.triton.quant.quant import dynamic_mxfp4_quant
@@ -151,3 +153,99 @@ def test_grouped_mxfp4_dual_v2_rejects_unconfigured_shape():
     )
     with pytest.raises(ValueError, match="feature size"):
         quantize_grouped_mxfp4_dual_v2(x, metadata)
+
+
+def _sorted_source_map(source_rows, routes, experts):
+    generator = torch.Generator(device="cpu").manual_seed(113)
+    source_rows_cpu = torch.randint(
+        source_rows, (routes,), generator=generator, device="cpu"
+    )
+    expert_cpu = (
+        torch.randint(experts - 1, (routes,), generator=generator, device="cpu") + 1
+    )
+    order = torch.argsort(expert_cpu, stable=True)
+    counts = tuple(torch.bincount(expert_cpu, minlength=experts).tolist())
+    source_map = source_rows_cpu.index_select(0, order).to(
+        device="cuda", dtype=torch.int32
+    )
+    return source_map, counts
+
+
+@pytest.mark.parametrize("features", [768, 1536, 2048])
+@pytest.mark.parametrize("zeros", [False, True])
+@pytest.mark.parametrize(("backend", "pad_multiple"), [("triton", 128), ("gluon", 256)])
+def test_grouped_mxfp4_dual_mapped_matches_explicit_sort(
+    features, zeros, backend, pad_multiple, monkeypatch
+):
+    if get_arch() != "gfx950":
+        pytest.skip("gfx950 required")
+    monkeypatch.setenv("AITER_GROUPED_MXFP4_MAPPED", "1")
+    monkeypatch.setenv("AITER_GROUPED_MXFP4_DUAL_V2", "0")
+    source_map, counts = _sorted_source_map(97, 193, 5)
+    torch.manual_seed(117)
+    source = torch.randn((97, features), dtype=torch.bfloat16, device="cuda")
+    if zeros:
+        source.zero_()
+    metadata = prepare_mxfp4_wgrad_metadata(
+        counts, source.device, pad_multiple=pad_multiple, backend=backend
+    )
+    explicit = source.index_select(0, source_map.long())
+
+    expected = (
+        quantize_grouped_mxfp4_dual_v2(explicit, metadata)
+        if pad_multiple == 256
+        else quantize_grouped_mxfp4_dual(explicit, metadata)
+    )
+    actual = quantize_grouped_mxfp4_dual_mapped(source, source_map, metadata)
+
+    for result, reference in zip(
+        (*actual[0], *actual[1]), (*expected[0], *expected[1])
+    ):
+        assert torch.equal(result, reference)
+    assert actual[0].source is source and actual[0].source_map is source_map
+    assert actual[1].source is source and actual[1].source_map is source_map
+
+
+def test_grouped_mxfp4_dual_mapped_rejects_unsupported_padding(monkeypatch):
+    if get_arch() != "gfx950":
+        pytest.skip("gfx950 required")
+    monkeypatch.setenv("AITER_GROUPED_MXFP4_MAPPED", "1")
+    source = torch.randn((1, 768), dtype=torch.bfloat16, device="cuda")
+    source_map = torch.zeros(1, dtype=torch.int32, device="cuda")
+    metadata = prepare_mxfp4_wgrad_metadata(
+        (1,), source.device, pad_multiple=384, backend="triton"
+    )
+    with pytest.raises(ValueError, match="unsupported padding"):
+        quantize_grouped_mxfp4_dual_mapped(source, source_map, metadata)
+
+
+def test_grouped_mxfp4_dual_mapped_empty_and_lifetime(monkeypatch):
+    if get_arch() != "gfx950":
+        pytest.skip("gfx950 required")
+    monkeypatch.setenv("AITER_GROUPED_MXFP4_MAPPED", "1")
+    source = torch.randn((7, 768), dtype=torch.bfloat16, device="cuda")
+    source_map = torch.empty(0, dtype=torch.int32, device="cuda")
+    metadata = prepare_mxfp4_wgrad_metadata(
+        (0, 0, 0), source.device, pad_multiple=256, backend="gluon"
+    )
+    source_ref, map_ref = weakref.ref(source), weakref.ref(source_map)
+
+    row, col = quantize_grouped_mxfp4_dual_mapped(source, source_map, metadata)
+    assert row.payload.shape == (0, 384) and row.scales.shape == (0, 24)
+    assert col.payload.shape == (768, 0) and col.scales.shape == (768, 0)
+    del source, source_map
+    gc.collect()
+    assert source_ref() is not None and map_ref() is not None
+
+
+def test_grouped_mxfp4_dual_mapped_is_default_off(monkeypatch):
+    if get_arch() != "gfx950":
+        pytest.skip("gfx950 required")
+    monkeypatch.delenv("AITER_GROUPED_MXFP4_MAPPED", raising=False)
+    source = torch.randn((1, 768), dtype=torch.bfloat16, device="cuda")
+    source_map = torch.zeros(1, dtype=torch.int32, device="cuda")
+    metadata = prepare_mxfp4_wgrad_metadata(
+        (1,), source.device, pad_multiple=256, backend="gluon"
+    )
+    with pytest.raises(RuntimeError, match="disabled"):
+        quantize_grouped_mxfp4_dual_mapped(source, source_map, metadata)

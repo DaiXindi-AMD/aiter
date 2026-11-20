@@ -26,6 +26,7 @@ _dual_repr = make_kernel_repr(
         "NUM_XCDS",
         "XCD_CHUNK",
         "USE_ASM",
+        "GATHER",
     ],
 )
 
@@ -37,10 +38,12 @@ _dual_repr = make_kernel_repr(
         "row_scale_stride",
         "col_payload_stride",
         "col_scale_stride",
+        "source_rows",
     ],
 )
 def _grouped_mxfp4_dual_kernel(
     input_ptr,
+    source_map_ptr,
     row_payload_ptr,
     row_scale_ptr,
     col_payload_ptr,
@@ -52,6 +55,7 @@ def _grouped_mxfp4_dual_kernel(
     row_scale_stride,
     col_payload_stride,
     col_scale_stride,
+    source_rows,
     F: tl.constexpr,
     PAD_MULTIPLE: tl.constexpr,
     BLOCK_SIZE_T: tl.constexpr,
@@ -64,6 +68,7 @@ def _grouped_mxfp4_dual_kernel(
     NUM_XCDS: tl.constexpr = 1,
     XCD_CHUNK: tl.constexpr = 1,
     USE_ASM: tl.constexpr = False,
+    GATHER: tl.constexpr = False,
 ):
     tl.static_assert(BLOCK_SIZE_T % 32 == 0)
     tl.static_assert(BLOCK_SIZE_F % 32 == 0)
@@ -89,9 +94,17 @@ def _grouped_mxfp4_dual_kernel(
         padded = tl.load(padded_offsets + expert).to(tl.int64)
     for part in tl.static_range(PAD_MULTIPLE // BLOCK_SIZE_T):
         token = start + local + part * BLOCK_SIZE_T + tl.arange(0, BLOCK_SIZE_T)
-        valid = (token[:, None] < end) & (feature[None, :] < F)
+        if GATHER:
+            source_token = tl.load(
+                source_map_ptr + token, mask=token < end, other=0
+            ).to(tl.int64)
+            source_valid = (source_token >= 0) & (source_token < source_rows)
+        else:
+            source_token = token
+            source_valid = token < end
+        valid = (token[:, None] < end) & source_valid[:, None] & (feature[None, :] < F)
         values = tl.load(
-            input_ptr + token[:, None] * F + feature[None, :],
+            input_ptr + source_token[:, None] * F + feature[None, :],
             mask=valid,
             other=0.0,
             cache_modifier=".cg",
