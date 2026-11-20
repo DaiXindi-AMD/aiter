@@ -28,6 +28,7 @@ from aiter.ops.triton.quant.fused_mxfp8_quant import (
 )
 from aiter.ops.triton.quant.grouped_mxfp4_dual import (
     quantize_grouped_mxfp4_dual,
+    quantize_grouped_mxfp4_dual_mapped,
     quantize_grouped_mxfp4_dual_v2,
 )
 from aiter.ops.triton.quant.quant import (
@@ -102,6 +103,7 @@ __all__ = [
     "quant_fp8_blockwise_for_weight",
     "quant_fp8_blockwise_segment_m",
     "quantize_grouped_mxfp4_dual",
+    "quantize_grouped_mxfp4_dual_mapped",
     "quantize_grouped_mxfp4_dual_v2",
     "requant_fp8_row_to_col",
     # quant.py exports

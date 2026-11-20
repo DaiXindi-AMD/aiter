@@ -30,7 +30,7 @@ class MXFP4WgradMetadata:
 
 @dataclass(frozen=True)
 class MXFP4ColwisePack:
-    """Two tensor views bound to their exact producer routing and source version."""
+    """Columnwise tensors bound to producer routing, source, and optional row map."""
 
     payload: torch.Tensor
     scales: torch.Tensor
@@ -38,6 +38,35 @@ class MXFP4ColwisePack:
     source: torch.Tensor
     source_version: int | None
     tensor_versions: tuple[int | None, int | None]
+    source_map: torch.Tensor | None = None
+    source_map_version: int | None = None
+
+    def __getitem__(self, index):
+        return (self.payload, self.scales)[index]
+
+    def __iter__(self):
+        return iter((self.payload, self.scales))
+
+    def __len__(self):
+        return 2
+
+    def record_stream(self, stream):
+        """Keep pack storage alive through work already queued on stream."""
+        self.payload.record_stream(stream)
+        self.scales.record_stream(stream)
+
+
+@dataclass(frozen=True)
+class MXFP4RowwisePack:
+    """Rowwise tensors bound to their source and optional destination-to-source map."""
+
+    payload: torch.Tensor
+    scales: torch.Tensor
+    source: torch.Tensor
+    source_version: int | None
+    tensor_versions: tuple[int | None, int | None]
+    source_map: torch.Tensor | None = None
+    source_map_version: int | None = None
 
     def __getitem__(self, index):
         return (self.payload, self.scales)[index]

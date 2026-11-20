@@ -4,6 +4,7 @@
 
 import argparse
 import json
+import os
 import statistics
 
 import torch
@@ -17,6 +18,7 @@ from aiter.ops.triton.quant.grouped_mxfp4_colwise import (
 from aiter.ops.triton.quant.grouped_mxfp4_dual import (
     quantize_grouped_mxfp4_concurrent,
     quantize_grouped_mxfp4_dual,
+    quantize_grouped_mxfp4_dual_mapped,
     quantize_grouped_mxfp4_dual_v2,
 )
 from aiter.ops.triton.quant.quant import dynamic_mxfp4_quant
@@ -40,7 +42,15 @@ def main():
     args = parser.parse_args()
     counts = (1536, 1280, 1152, 1024, 960, 896, 768, 640) * 4
     rows = sum(counts)
-    x = torch.randn((rows, args.features), dtype=torch.bfloat16, device="cuda")
+    source_rows = (rows + 3) // 4
+    source = torch.randn(
+        (source_rows, args.features), dtype=torch.bfloat16, device="cuda"
+    )
+    source_map = (torch.arange(rows, device=source.device) % source_rows).to(
+        torch.int32
+    )
+    source_map_long = source_map.long()
+    x = source.index_select(0, source_map_long)
     metadata = prepare_mxfp4_wgrad_metadata(
         counts, x.device, pad_multiple=256, backend="gluon"
     )
@@ -56,13 +66,27 @@ def main():
         torch.cuda.current_stream().wait_event(ready)
         return row, col
 
+    def explicit_gather_v2():
+        gathered = source.index_select(0, source_map_long)
+        return quantize_grouped_mxfp4_dual_v2(gathered, metadata)
+
+    def mapped():
+        return quantize_grouped_mxfp4_dual_mapped(source, source_map, metadata)
+
     providers = [
         ("separate", separate),
         ("dual", dual),
         ("concurrent", concurrent),
     ]
     if get_arch() == "gfx950":
-        providers.append(("v2", lambda: quantize_grouped_mxfp4_dual_v2(x, metadata)))
+        providers.extend(
+            [
+                ("v2", lambda: quantize_grouped_mxfp4_dual_v2(x, metadata)),
+                ("explicit_gather_v2", explicit_gather_v2),
+            ]
+        )
+        if os.environ.get("AITER_GROUPED_MXFP4_MAPPED") == "1":
+            providers.append(("mapped", mapped))
     for _ in range(5):
         for _, operation in providers:
             operation()
@@ -106,6 +130,15 @@ def main():
         result["v2_median_ms"] = v2_ms
         result["v2_speedup"] = separate_ms / v2_ms
         result["v2_vs_dual"] = dual_ms / v2_ms
+    if "mapped_ms" in samples:
+        gathered_ms = statistics.median(samples["explicit_gather_v2_ms"])
+        mapped_ms = statistics.median(samples["mapped_ms"])
+        result["explicit_gather_v2_median_ms"] = gathered_ms
+        result["mapped_median_ms"] = mapped_ms
+        result["mapped_vs_explicit_gather_speedup"] = gathered_ms / mapped_ms
+        gather_bytes = rows * args.features * 2
+        result["removed_bf16_gather_buffer_bytes"] = gather_bytes
+        result["avoided_logical_intermediate_traffic_bytes"] = 2 * gather_bytes
     print(json.dumps(result, indent=2))
 
 
