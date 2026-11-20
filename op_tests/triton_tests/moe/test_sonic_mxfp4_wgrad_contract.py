@@ -6,11 +6,53 @@ import pytest
 import torch
 
 from aiter.ops.triton.moe.sonic_mxfp4 import (
+    _main_grad_accumulate,
     _validate_main_grads,
     moe_pre_routed_a4w4,
 )
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+
+
+def test_main_grad_first_write_then_accumulate():
+    weights = (
+        torch.empty((2, 64, 64), dtype=torch.bfloat16, device="cuda"),
+        torch.empty((2, 32, 64), dtype=torch.bfloat16, device="cuda"),
+    )
+    main_grads = tuple(
+        torch.zeros_like(weight, dtype=torch.float32) for weight in weights
+    )
+    for weight in weights:
+        weight.grad_added_to_main_grad = False
+    assert not _main_grad_accumulate(weights, main_grads)
+    for weight in weights:
+        weight.grad_added_to_main_grad = True
+    assert _main_grad_accumulate(weights, main_grads)
+
+
+def test_main_grad_first_write_state_must_match():
+    weights = (
+        torch.empty((2, 64, 64), dtype=torch.bfloat16, device="cuda"),
+        torch.empty((2, 32, 64), dtype=torch.bfloat16, device="cuda"),
+    )
+    main_grads = tuple(
+        torch.zeros_like(weight, dtype=torch.float32) for weight in weights
+    )
+    weights[0].grad_added_to_main_grad = False
+    weights[1].grad_added_to_main_grad = True
+    with pytest.raises(ValueError, match="first-write state"):
+        _main_grad_accumulate(weights, main_grads)
+
+
+def test_main_grad_without_megatron_bookkeeping_remains_additive():
+    weights = (
+        torch.empty((2, 64, 64), dtype=torch.bfloat16, device="cuda"),
+        torch.empty((2, 32, 64), dtype=torch.bfloat16, device="cuda"),
+    )
+    main_grads = tuple(
+        torch.zeros_like(weight, dtype=torch.float32) for weight in weights
+    )
+    assert _main_grad_accumulate(weights, main_grads)
 
 
 @pytest.mark.parametrize("existing", [0, 1])

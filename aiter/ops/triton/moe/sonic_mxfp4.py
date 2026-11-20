@@ -136,6 +136,23 @@ def _validate_main_grads(main_grads, weights):
         raise ValueError("main_grad buffers must not overlap each other")
 
 
+def _main_grad_accumulate(weights, main_grads):
+    """Use overwrite for the first DDP write and add for later microbatches."""
+    if main_grads is None:
+        return False
+    flags = tuple(
+        getattr(weight, "grad_added_to_main_grad", None) for weight in weights
+    )
+    if any(flag is None for flag in flags):
+        # Public callers without Megatron bookkeeping keep the additive contract.
+        return True
+    if any(type(flag) is not bool for flag in flags):
+        raise ValueError("grad_added_to_main_grad must be bool")
+    if flags[0] != flags[1]:
+        raise ValueError("main_grad weights disagree on first-write state")
+    return flags[0]
+
+
 class _PreRoutedMXFP4(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -272,6 +289,7 @@ class _PreRoutedMXFP4(torch.autograd.Function):
         dy = _routed_weight(dout, scores)
         if ctx.wgrad_mode == "mxfp4":
             targets = ctx.main_grads or (None, None)
+            accumulate_main_grads = _main_grad_accumulate((w1, w2), ctx.main_grads)
             if ctx.dual_quant_mode == "concurrent":
                 dy_col, dy_ready = quantize_grouped_mxfp4_colwise_async(
                     dy, ctx.wgrad_meta
@@ -300,7 +318,7 @@ class _PreRoutedMXFP4(torch.autograd.Function):
                 dh,
                 counts,
                 out=targets[0],
-                accumulate=ctx.main_grads is not None,
+                accumulate=accumulate_main_grads,
                 metadata=ctx.wgrad_meta,
                 quantized_operands=dw1_quant,
                 transpose_output=True,
@@ -314,7 +332,7 @@ class _PreRoutedMXFP4(torch.autograd.Function):
                 dy,
                 counts,
                 out=targets[1],
-                accumulate=ctx.main_grads is not None,
+                accumulate=accumulate_main_grads,
                 metadata=ctx.wgrad_meta,
                 quantized_operands=dw2_quant,
                 transpose_output=True,
@@ -451,12 +469,13 @@ class _PreRoutedMappedMXFP4(torch.autograd.Function):
         dy = _routed_weight(dout, scores)
         dy_col = quantize_grouped_mxfp4_colwise(dy, ctx.wgrad_meta)
         targets = ctx.main_grads or (None, None)
+        accumulate_main_grads = _main_grad_accumulate((w1, w2), ctx.main_grads)
         dw1 = grouped_mxfp4_wgrad(
             source,
             dh,
             counts,
             out=targets[0],
-            accumulate=ctx.main_grads is not None,
+            accumulate=accumulate_main_grads,
             metadata=ctx.wgrad_meta,
             quantized_operands=(ctx.wgrad_xp, dh_col),
             transpose_output=True,
@@ -467,7 +486,7 @@ class _PreRoutedMappedMXFP4(torch.autograd.Function):
             dy,
             counts,
             out=targets[1],
-            accumulate=ctx.main_grads is not None,
+            accumulate=accumulate_main_grads,
             metadata=ctx.wgrad_meta,
             quantized_operands=(ctx.wgrad_ap, dy_col),
             transpose_output=True,
@@ -498,8 +517,10 @@ def _pre_routed_mxfp4(
 ):
     """Return BF16 expert-major [R,H]; weights are BF16 w1[E,H,2I], w2[E,I,H].
 
-    Native Wgrad accepts caller-owned FP32 main_grads and always adds to them.
-    The caller must zero buffers at each optimizer step and invalidate weight packs
+    Native Wgrad accepts caller-owned FP32 main_grads. Megatron parameters with
+    grad_added_to_main_grad=False overwrite on the first microbatch and add on
+    later microbatches; other callers retain the additive contract. The caller
+    must still zero buffers at each optimizer step and invalidate weight packs
     after update/load. With no buffers, autograd returns parameter-dtype gradients.
     """
     if recipe not in RECIPES:
