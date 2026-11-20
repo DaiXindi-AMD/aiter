@@ -292,7 +292,7 @@ def quantize_grouped_mxfp4_dual_mapped(source, source_map, metadata):
     source row. Set ``AITER_GROUPED_MXFP4_MAPPED=1`` to enable this gfx950
     path. The tuple-compatible packs retain source/map identity and versions;
     mapped columnwise packs are valid Wgrad operands. Supported feature counts
-    are 768, 1536, and 2048.
+    are 768, 1536, and 2048. Expert padding can be 128 or 256 rows.
     """
     enabled = os.environ.get("AITER_GROUPED_MXFP4_MAPPED", "0")
     if enabled not in ("0", "1"):
@@ -304,8 +304,8 @@ def quantize_grouped_mxfp4_dual_mapped(source, source_map, metadata):
         raise ValueError("mapped grouped MXFP4 dual quant supports gfx950 only")
     cfg = _load_dual_config("GROUPED-MXFP4-DUAL-V2", source.device)
     bt, bf = _validate_dual_tile(cfg, metadata)
-    if metadata.pad_multiple != cfg["PAD_MULTIPLE"]:
-        raise ValueError("mapped grouped MXFP4 dual quant requires configured padding")
+    if metadata.pad_multiple not in cfg["SUPPORTED_PAD_MULTIPLES"]:
+        raise ValueError("mapped grouped MXFP4 dual quant has unsupported padding")
     if source.shape[1] not in cfg["SUPPORTED_FEATURES"]:
         raise ValueError(
             "mapped grouped MXFP4 dual quant does not support this feature size"

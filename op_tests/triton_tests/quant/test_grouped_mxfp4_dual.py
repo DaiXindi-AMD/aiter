@@ -173,21 +173,29 @@ def _sorted_source_map(source_rows, routes, experts):
 
 @pytest.mark.parametrize("features", [768, 1536, 2048])
 @pytest.mark.parametrize("zeros", [False, True])
-def test_grouped_mxfp4_dual_mapped_matches_explicit_sort(features, zeros, monkeypatch):
+@pytest.mark.parametrize(("backend", "pad_multiple"), [("triton", 128), ("gluon", 256)])
+def test_grouped_mxfp4_dual_mapped_matches_explicit_sort(
+    features, zeros, backend, pad_multiple, monkeypatch
+):
     if get_arch() != "gfx950":
         pytest.skip("gfx950 required")
     monkeypatch.setenv("AITER_GROUPED_MXFP4_MAPPED", "1")
+    monkeypatch.setenv("AITER_GROUPED_MXFP4_DUAL_V2", "0")
     source_map, counts = _sorted_source_map(97, 193, 5)
     torch.manual_seed(117)
     source = torch.randn((97, features), dtype=torch.bfloat16, device="cuda")
     if zeros:
         source.zero_()
     metadata = prepare_mxfp4_wgrad_metadata(
-        counts, source.device, pad_multiple=256, backend="gluon"
+        counts, source.device, pad_multiple=pad_multiple, backend=backend
     )
     explicit = source.index_select(0, source_map.long())
 
-    expected = quantize_grouped_mxfp4_dual_v2(explicit, metadata)
+    expected = (
+        quantize_grouped_mxfp4_dual_v2(explicit, metadata)
+        if pad_multiple == 256
+        else quantize_grouped_mxfp4_dual(explicit, metadata)
+    )
     actual = quantize_grouped_mxfp4_dual_mapped(source, source_map, metadata)
 
     for result, reference in zip(
@@ -196,6 +204,19 @@ def test_grouped_mxfp4_dual_mapped_matches_explicit_sort(features, zeros, monkey
         assert torch.equal(result, reference)
     assert actual[0].source is source and actual[0].source_map is source_map
     assert actual[1].source is source and actual[1].source_map is source_map
+
+
+def test_grouped_mxfp4_dual_mapped_rejects_unsupported_padding(monkeypatch):
+    if get_arch() != "gfx950":
+        pytest.skip("gfx950 required")
+    monkeypatch.setenv("AITER_GROUPED_MXFP4_MAPPED", "1")
+    source = torch.randn((1, 768), dtype=torch.bfloat16, device="cuda")
+    source_map = torch.zeros(1, dtype=torch.int32, device="cuda")
+    metadata = prepare_mxfp4_wgrad_metadata(
+        (1,), source.device, pad_multiple=384, backend="triton"
+    )
+    with pytest.raises(ValueError, match="unsupported padding"):
+        quantize_grouped_mxfp4_dual_mapped(source, source_map, metadata)
 
 
 def test_grouped_mxfp4_dual_mapped_empty_and_lifetime(monkeypatch):
