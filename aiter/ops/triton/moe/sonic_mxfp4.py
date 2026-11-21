@@ -12,6 +12,7 @@ import os
 import torch
 
 from aiter.ops.triton._triton_kernels.moe.sonicmoe.row_scale import row_scale_fp32
+from aiter.ops.triton.gemm.grouped.bf16_wgrad import grouped_bf16_wgrad
 from aiter.ops.triton.gemm.grouped.mxfp4_wgrad import (
     MXFP4_WGRAD_BACKENDS,
     check_mxfp4_wgrad_support,
@@ -38,6 +39,7 @@ from aiter.ops.triton.quant.grouped_mxfp4_dual import (
 from aiter.ops.triton.utils.mxfp4_wgrad import tensor_version
 
 __all__ = [
+    "BF16_WGRAD_MAIN_GRAD_API_VERSION",
     "MAPPED_DUAL_QUANT_API_VERSION",
     "MXFP4_WGRAD_API_VERSION",
     "MXFP4_WGRAD_BACKENDS",
@@ -50,6 +52,7 @@ __all__ = [
     "moe_pre_routed_w4a16",
     "pack_pre_routed_weights",
 ]
+BF16_WGRAD_MAIN_GRAD_API_VERSION = 1
 MAPPED_DUAL_QUANT_API_VERSION = 1
 MXFP4_WGRAD_API_VERSION = 1
 
@@ -362,10 +365,35 @@ class _PreRoutedMXFP4(torch.autograd.Function):
             else:
                 dw1, dw2 = dw1.to(w1.dtype), dw2.to(w2.dtype)
         else:
-            # Preserve the current BF16 control; zeros give empty experts defined gradients.
-            dw1, dw2 = torch.zeros_like(w1), torch.zeros_like(w2)
-            grouped_gemm(x, dh, ctx.offsets, out=dw1, A_is_transposed=True)
-            grouped_gemm(a, dy, ctx.offsets, out=dw2, A_is_transposed=True)
+            if ctx.main_grads is None:
+                # Preserve the control; zeros give empty experts defined gradients.
+                dw1, dw2 = torch.zeros_like(w1), torch.zeros_like(w2)
+                grouped_gemm(x, dh, ctx.offsets, out=dw1, A_is_transposed=True)
+                grouped_gemm(a, dy, ctx.offsets, out=dw2, A_is_transposed=True)
+            else:
+                accumulate = _main_grad_accumulate((w1, w2), ctx.main_grads)
+                grouped_bf16_wgrad(
+                    x,
+                    dh,
+                    counts,
+                    out=ctx.main_grads[0],
+                    accumulate=accumulate,
+                    offsets=ctx.offsets,
+                    transpose_output=True,
+                )
+                grouped_bf16_wgrad(
+                    a,
+                    dy,
+                    counts,
+                    out=ctx.main_grads[1],
+                    accumulate=accumulate,
+                    offsets=ctx.offsets,
+                    transpose_output=True,
+                )
+                for weight in (w1, w2):
+                    if hasattr(weight, "grad_added_to_main_grad"):
+                        weight.grad_added_to_main_grad = True
+                dw1 = dw2 = None
         return dx, ds, dw1, dw2, None, None, None, None, None, None, None
 
 
@@ -544,8 +572,6 @@ def _pre_routed_mxfp4(
         wgrad_mode == "mxfp4" and recipe != "a4w4"
     ):
         raise ValueError("native MXFP4 Wgrad is supported only for the a4w4 recipe")
-    if main_grads is not None and wgrad_mode != "mxfp4":
-        raise ValueError("main_grads requires native MXFP4 Wgrad")
     if (
         x.ndim != 2
         or not x.is_cuda
@@ -594,8 +620,8 @@ def _pre_routed_mxfp4(
             raise NotImplementedError(
                 "W1/W2 require the same metadata padding contract"
             )
-        if main_grads is not None:
-            _validate_main_grads(main_grads, (w1, w2))
+    if main_grads is not None:
+        _validate_main_grads(main_grads, (w1, w2))
     return _PreRoutedMXFP4.apply(
         x,
         scores,

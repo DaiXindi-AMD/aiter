@@ -77,12 +77,15 @@ def grouped_gemm(
     B_scale: torch.Tensor | None = None,
     block_size: int = 128,
     out_dtype: torch.dtype | None = None,
+    accumulate: bool = False,
 ):
     """Run grouped GEMM, optionally with 1x128 activation and 128x128 weight scales."""
     if (A_scale is None) != (B_scale is None):
         raise ValueError("A_scale and B_scale must be provided together")
     if A_scale is not None and block_size != 128:
         raise ValueError("Sonic blockwise FP8 requires block_size=128")
+    if accumulate and (not A_is_transposed or out is None):
+        raise ValueError("accumulate requires grouped wgrad with an initialized out")
     if A_is_transposed:
         if B_is_transposed:
             raise ValueError("a grouped wgrad does not support a transposed B")
@@ -113,6 +116,7 @@ def grouped_gemm(
         triton_b_scale,
         block_size,
         out_dtype,
+        accumulate,
     )
     return out if out is not None else result
 
@@ -130,11 +134,23 @@ def _grouped_gemm_triton(
     B_scale: torch.Tensor | None = None,
     block_size: int = 128,
     out_dtype: torch.dtype | None = None,
+    accumulate: bool = False,
 ):
     if A_is_transposed and B.dim() == 2:
         return _grouped_gemm_dw(
-            A, B, cu_seqlens, out, A_idx, A_scale, B_scale, block_size, out_dtype
+            A,
+            B,
+            cu_seqlens,
+            out,
+            A_idx,
+            A_scale,
+            B_scale,
+            block_size,
+            out_dtype,
+            accumulate,
         )
+    if accumulate:
+        raise ValueError("accumulate is supported only for grouped wgrad")
 
     E = B.shape[0]
     K_dim = B.shape[1]
@@ -226,7 +242,10 @@ def _grouped_gemm_dw(
     B_scale: torch.Tensor | None = None,
     block_size: int = 128,
     out_dtype: torch.dtype | None = None,
+    accumulate: bool = False,
 ):
+    if accumulate and out is None:
+        raise ValueError("accumulate requires initialized out")
     K_dim = A.shape[1]
     N = B.shape[1]
     E = cu_seqlens.shape[0] - 1
@@ -307,6 +326,7 @@ def _grouped_gemm_dw(
         "SCALE_BLOCK_SIZE": block_size,
         "BLOCKWISE_FP8": blockwise_fp8,
         "HAS_GATHER_IDX": A_idx is not None,
+        "ACCUMULATE": accumulate,
     }
     dw_cfg = get_grouped_gemm_dw_config(
         N, K_dim, E, A_idx is not None, _use_qwen3_tuned_configs()

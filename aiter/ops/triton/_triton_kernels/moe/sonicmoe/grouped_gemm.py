@@ -35,6 +35,7 @@ _grouped_gemm_dw_repr = make_kernel_repr(
         "BLOCK_N",
         "BLOCK_T",
         "HAS_GATHER_IDX",
+        "ACCUMULATE",
     ],
 )
 
@@ -231,6 +232,7 @@ def _grouped_gemm_dw_kernel(
     BLOCK_N: tl.constexpr,
     BLOCK_T: tl.constexpr,
     HAS_GATHER_IDX: tl.constexpr,
+    ACCUMULATE: tl.constexpr,
 ):
     pid = tl.program_id(0)
     num_k_blocks: tl.constexpr = tl.cdiv(K, BLOCK_K)
@@ -316,4 +318,8 @@ def _grouped_gemm_dw_kernel(
         + offs_n[None, :].to(tl.int64) * stride_cn
     )
     c_mask = k_mask[:, None] & n_mask[None, :]
-    tl.store(c_ptrs, c, mask=c_mask)
+    if ACCUMULATE:
+        previous = tl.load(c_ptrs, mask=c_mask, other=0.0)
+        tl.store(c_ptrs, previous + c, mask=c_mask)
+    else:
+        tl.store(c_ptrs, c, mask=c_mask)

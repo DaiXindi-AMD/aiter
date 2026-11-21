@@ -116,6 +116,62 @@ def test_pinned_host_counts_preserve_forward_and_backward():
             torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
+def test_bf16_wgrad_writes_and_accumulates_fp32_main_grad():
+    counts = (3, 0, 7, 5)
+    torch.manual_seed(177)
+    weights = (
+        torch.randn((4, 64, 64), dtype=torch.bfloat16, device="cuda") * 0.02,
+        torch.randn((4, 32, 64), dtype=torch.bfloat16, device="cuda") * 0.02,
+    )
+    direct_weights = tuple(w.detach().clone().requires_grad_() for w in weights)
+    reference_weights = tuple(w.detach().clone().requires_grad_() for w in weights)
+    main_grads = tuple(
+        torch.full_like(w, float("nan"), dtype=torch.float32) for w in direct_weights
+    )
+    for weight in direct_weights:
+        weight.grad_added_to_main_grad = False
+
+    expected = [torch.zeros_like(g) for g in main_grads]
+    for seed in (178, 179):
+        torch.manual_seed(seed)
+        x = torch.randn((15, 64), dtype=torch.bfloat16, device="cuda")
+        scores = torch.rand((15,), dtype=torch.float32, device="cuda")
+        dout = torch.randn_like(x)
+        reference = moe_pre_routed_a4w4(
+            x.detach().clone().requires_grad_(),
+            scores.detach().clone().requires_grad_(),
+            counts,
+            *reference_weights,
+        )
+        (reference * dout).sum().backward()
+        for total, weight in zip(expected, reference_weights):
+            total.add_(weight.grad.float())
+            weight.grad = None
+
+        direct = moe_pre_routed_a4w4(
+            x.detach().clone().requires_grad_(),
+            scores.detach().clone().requires_grad_(),
+            counts,
+            *direct_weights,
+            wgrad_mode="bf16",
+            main_grads=main_grads,
+        )
+        (direct * dout).sum().backward()
+        assert all(w.grad is None and w.grad_added_to_main_grad for w in direct_weights)
+
+    for actual, reference in zip(main_grads, expected):
+        # Direct FP32 output avoids the control path's intermediate BF16 rounding.
+        error = (actual - reference).float()
+        relative = error.norm() / reference.float().norm().clamp_min(1e-20)
+        snr_db = 20 * torch.log10(
+            reference.float().norm().clamp_min(1e-20) / error.norm().clamp_min(1e-20)
+        )
+        assert relative < 0.0018
+        assert snr_db > 55
+        assert error.abs().max() < 4.5e-4
+        assert torch.count_nonzero(actual[1]) == 0
+
+
 def _decoded(weight):
     return decode(*pack_grouped_mxfp4_weights(weight))
 
