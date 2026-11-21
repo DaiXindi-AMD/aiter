@@ -6,7 +6,10 @@ import pytest
 import torch
 from test_sonic_mxfp4 import decode
 
-from aiter.ops.triton.gemm.grouped.sonic_mxfp4 import pack_grouped_mxfp4_weights
+from aiter.ops.triton.gemm.grouped.sonic_mxfp4 import (
+    pack_grouped_mxfp4_weights,
+    prepare_expert_offsets,
+)
 from aiter.ops.triton.moe.sonic_mxfp4 import (
     RECIPES as EXPERT_RECIPES,
 )
@@ -64,6 +67,53 @@ def _recipe(name):
 
 
 ENTRYPOINTS = sorted(_OPERATIONS)
+
+
+def test_device_counts_build_identical_offsets():
+    counts = (3, 0, 7, 5)
+    device_counts = torch.tensor(counts, dtype=torch.int64, device="cuda")
+    expected = torch.tensor((0, 3, 3, 10, 15), dtype=torch.int32, device="cuda")
+    actual = prepare_expert_offsets(counts, device_counts.device, device_counts)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_device_counts_reject_invalid_contract():
+    counts = (3, 0, 7, 5)
+    device_counts = torch.tensor(counts[:-1], dtype=torch.int64, device="cuda")
+    with pytest.raises(ValueError, match="device_counts"):
+        prepare_expert_offsets(counts, device_counts.device, device_counts)
+
+
+def test_pinned_host_counts_preserve_forward_and_backward():
+    counts = (3, 0, 7, 5)
+    torch.manual_seed(176)
+    inputs = torch.randn((15, 64), dtype=torch.bfloat16, device="cuda")
+    scores = torch.linspace(0, 1, 15, dtype=torch.float32, device="cuda")
+    w1 = torch.randn((4, 64, 64), dtype=torch.bfloat16, device="cuda") * 0.02
+    w2 = torch.randn((4, 32, 64), dtype=torch.bfloat16, device="cuda") * 0.02
+    dout = torch.randn_like(inputs)
+
+    def run(count_arg):
+        args = tuple(
+            value.detach().clone().requires_grad_() for value in (inputs, w1, w2)
+        )
+        routed_scores = scores.detach().clone().requires_grad_()
+        output = moe_pre_routed_a4w4(
+            args[0], routed_scores, count_arg, args[1], args[2]
+        )
+        (output * dout).sum().backward()
+        return output, tuple(
+            value.grad for value in (args[0], routed_scores, *args[1:])
+        )
+
+    baseline = run(counts)
+    candidate = run(torch.tensor(counts, dtype=torch.int64, pin_memory=True))
+    for actual, expected in zip(candidate, baseline):
+        if isinstance(actual, tuple):
+            for actual_grad, expected_grad in zip(actual, expected):
+                torch.testing.assert_close(actual_grad, expected_grad, rtol=0, atol=0)
+        else:
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 def _decoded(weight):

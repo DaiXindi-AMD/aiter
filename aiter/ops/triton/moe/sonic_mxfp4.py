@@ -83,9 +83,9 @@ def pack_pre_routed_weights(w1, w2):
     )
 
 
-def _metadata(counts, device, shapes, family, offsets=None):
+def _metadata(counts, device, shapes, family, offsets=None, device_counts=None):
     if offsets is None:
-        offsets = prepare_expert_offsets(counts, device)
+        offsets = prepare_expert_offsets(counts, device, device_counts)
     blocks = {block_shape(family, max(counts), n, k, len(counts)) for n, k in shapes}
     if len(blocks) != 1:
         return None, offsets
@@ -178,6 +178,7 @@ class _PreRoutedMXFP4(torch.autograd.Function):
         w1,
         w2,
         counts,
+        device_counts,
         recipe,
         packed,
         wgrad_mode,
@@ -188,7 +189,11 @@ class _PreRoutedMXFP4(torch.autograd.Function):
         _e, h, j = w1.shape
         i = j // 2
         meta, offsets = _metadata(
-            counts, x.device, ((j, h), (h, i)), _FAMILY[fwd_format]
+            counts,
+            x.device,
+            ((j, h), (h, i)),
+            _FAMILY[fwd_format],
+            device_counts=device_counts,
         )
         if _FAMILY[bwd_format] == _FAMILY[fwd_format]:
             bwd_meta = meta
@@ -361,7 +366,7 @@ class _PreRoutedMXFP4(torch.autograd.Function):
             dw1, dw2 = torch.zeros_like(w1), torch.zeros_like(w2)
             grouped_gemm(x, dh, ctx.offsets, out=dw1, A_is_transposed=True)
             grouped_gemm(a, dy, ctx.offsets, out=dw2, A_is_transposed=True)
-        return dx, ds, dw1, dw2, None, None, None, None, None, None
+        return dx, ds, dw1, dw2, None, None, None, None, None, None, None
 
 
 class _PreRoutedMappedMXFP4(torch.autograd.Function):
@@ -564,9 +569,14 @@ def _pre_routed_mxfp4(
         for w in (w1, w2)
     ):
         raise ValueError("weights must be contiguous BF16 on x.device")
+    device_counts = None
     if isinstance(counts, torch.Tensor):
         if counts.ndim != 1 or counts.dtype not in (torch.int32, torch.int64):
             raise ValueError("counts must be an integer vector")
+        if counts.device.type == "cpu" and counts.is_pinned():
+            device_counts = counts.detach().to(device=x.device, non_blocking=True)
+        elif counts.device == x.device:
+            device_counts = counts.detach()
         counts = tuple(counts.detach().cpu().tolist())
     if not isinstance(counts, (list, tuple)) or len(counts) != e:
         raise ValueError("counts must have E entries")
@@ -587,7 +597,17 @@ def _pre_routed_mxfp4(
         if main_grads is not None:
             _validate_main_grads(main_grads, (w1, w2))
     return _PreRoutedMXFP4.apply(
-        x, scores, w1, w2, counts, recipe, packed, wgrad_mode, main_grads, wgrad_backend
+        x,
+        scores,
+        w1,
+        w2,
+        counts,
+        device_counts,
+        recipe,
+        packed,
+        wgrad_mode,
+        main_grads,
+        wgrad_backend,
     )
 
 

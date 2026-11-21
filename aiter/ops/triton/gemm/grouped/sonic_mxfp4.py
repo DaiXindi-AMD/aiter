@@ -112,16 +112,28 @@ def quantize_grouped_activation(x, activation_format):
     return payload, scales.contiguous()
 
 
-def prepare_expert_offsets(counts, device):
-    """Cumulative [E+1] row offsets for host ``counts`` with one H2D copy.
+def prepare_expert_offsets(counts, device, device_counts=None):
+    """Cumulative [E+1] row offsets for host ``counts``.
 
     Independent of the GEMM block shape, so one call serves every GEMM that shares
-    the same routing (forward F1/F2 and backward D1/D2).
+    the same routing (forward F1/F2 and backward D1/D2). A validated device copy
+    avoids a blocking H2D transfer of host counts.
     """
     e = len(counts)
     if e <= 0:
         raise ValueError("counts must be non-empty")
-    counts_dev = torch.as_tensor(counts, dtype=torch.int32, device=device)
+    if device_counts is None:
+        counts_dev = torch.as_tensor(counts, dtype=torch.int32, device=device)
+    else:
+        if (
+            not isinstance(device_counts, torch.Tensor)
+            or device_counts.shape != (e,)
+            or device_counts.device != torch.device(device)
+            or device_counts.dtype not in (torch.int32, torch.int64)
+            or not device_counts.is_contiguous()
+        ):
+            raise ValueError("device_counts must be a contiguous GPU integer vector")
+        counts_dev = device_counts.to(dtype=torch.int32)
     return torch.cat(
         (
             torch.zeros(1, dtype=torch.int32, device=device),
