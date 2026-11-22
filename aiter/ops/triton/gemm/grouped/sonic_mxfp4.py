@@ -34,6 +34,7 @@ __all__ = [
     "pack_grouped_mxfp4_weights",
     "prepare_expert_offsets",
     "prepare_grouped_gemm_metadata",
+    "prepare_grouped_gemm_metadata_host",
     "quantize_grouped_activation",
 ]
 
@@ -161,6 +162,51 @@ def prepare_grouped_gemm_metadata(counts, device, block_m, block_n, offsets=None
         "block_n": block_n,
         "e": len(counts),
     }
+
+
+def prepare_grouped_gemm_metadata_host(counts, device, block_m, block_n, ns):
+    """Build :func:`prepare_grouped_gemm_metadata` plus every N's block base on host.
+
+    Values are identical to the device-built metadata, but all of them reach the
+    GPU in one pinned non-blocking copy ordered on the current stream instead of
+    several tiny integer kernels per GEMM shape. N values outside ``ns`` are still
+    derived lazily on device.
+    """
+    counts = tuple(counts)
+    e = len(counts)
+    if e <= 0:
+        raise ValueError("counts must be non-empty")
+    if any(type(c) is not int or c < 0 for c in counts):
+        raise ValueError("counts must be nonnegative host integers")
+    if block_m <= 0 or block_n <= 0:
+        raise ValueError("block shape must be positive")
+    ns = tuple(dict.fromkeys(int(n) for n in ns))
+    offsets = [0]
+    for c in counts:
+        offsets.append(offsets[-1] + c)
+    values = offsets + list(counts)
+    for n in ns:
+        tiles_n = triton.cdiv(n, block_n)
+        base = [0]
+        for c in counts:
+            base.append(base[-1] + triton.cdiv(c, block_m) * tiles_n)
+        values.extend(base)
+    if max(values) >= 2**31:
+        raise ValueError("grouped GEMM metadata exceeds int32")
+    host = torch.tensor(values, dtype=torch.int32, pin_memory=True)
+    packed = host.to(device=device, non_blocking=True)
+    meta = {
+        "counts_dev": packed[e + 1 : 2 * e + 1],
+        "offsets": packed[: e + 1],
+        "block_m": block_m,
+        "block_n": block_n,
+        "e": e,
+    }
+    start = 2 * e + 1
+    for n in ns:
+        meta[("block_base", n)] = packed[start : start + e + 1]
+        start += e + 1
+    return meta
 
 
 def _expert_block_base(meta, n):

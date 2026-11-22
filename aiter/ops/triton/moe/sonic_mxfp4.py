@@ -25,6 +25,7 @@ from aiter.ops.triton.gemm.grouped.sonic_mxfp4 import (
     pack_grouped_mxfp4_weights,
     prepare_expert_offsets,
     prepare_grouped_gemm_metadata,
+    prepare_grouped_gemm_metadata_host,
 )
 from aiter.ops.triton.moe.sonicmoe import activation_bwd, activation_fwd, grouped_gemm
 from aiter.ops.triton.quant.grouped_mxfp4_colwise import (
@@ -86,10 +87,33 @@ def pack_pre_routed_weights(w1, w2):
     )
 
 
-def _metadata(counts, device, shapes, family, offsets=None, device_counts=None):
+def _host_metadata_enabled():
+    """Build grouped GEMM metadata on host by default; 0 restores device building."""
+    return os.environ.get("AITER_SONIC_HOST_METADATA", "1") != "0"
+
+
+def _metadata(
+    counts,
+    device,
+    shapes,
+    family,
+    offsets=None,
+    device_counts=None,
+    extra_ns=(),
+):
+    blocks = {block_shape(family, max(counts), n, k, len(counts)) for n, k in shapes}
+    if offsets is None and len(blocks) == 1 and _host_metadata_enabled():
+        block_m, block_n = next(iter(blocks))
+        meta = prepare_grouped_gemm_metadata_host(
+            counts,
+            device,
+            block_m,
+            block_n,
+            (*(n for n, _k in shapes), *extra_ns),
+        )
+        return meta, meta["offsets"]
     if offsets is None:
         offsets = prepare_expert_offsets(counts, device, device_counts)
-    blocks = {block_shape(family, max(counts), n, k, len(counts)) for n, k in shapes}
     if len(blocks) != 1:
         return None, offsets
     block_m, block_n = next(iter(blocks))
@@ -191,14 +215,16 @@ class _PreRoutedMXFP4(torch.autograd.Function):
         fwd_format, bwd_format = RECIPES[recipe]
         _e, h, j = w1.shape
         i = j // 2
+        shared_family = _FAMILY[bwd_format] == _FAMILY[fwd_format]
         meta, offsets = _metadata(
             counts,
             x.device,
             ((j, h), (h, i)),
             _FAMILY[fwd_format],
             device_counts=device_counts,
+            extra_ns=(i,) if shared_family else (),
         )
-        if _FAMILY[bwd_format] == _FAMILY[fwd_format]:
+        if shared_family:
             bwd_meta = meta
         else:
             bwd_meta, _ = _metadata(
@@ -414,7 +440,11 @@ class _PreRoutedMappedMXFP4(torch.autograd.Function):
         _e, h, j = w1.shape
         i = j // 2
         meta, offsets = _metadata(
-            counts, source_tokens.device, ((j, h), (h, i)), _FAMILY["mxfp4"]
+            counts,
+            source_tokens.device,
+            ((j, h), (h, i)),
+            _FAMILY["mxfp4"],
+            extra_ns=(i,),
         )
         cfg, _ = check_mxfp4_wgrad_support(
             source_tokens.device,
@@ -599,7 +629,11 @@ def _pre_routed_mxfp4(
     if isinstance(counts, torch.Tensor):
         if counts.ndim != 1 or counts.dtype not in (torch.int32, torch.int64):
             raise ValueError("counts must be an integer vector")
-        if counts.device.type == "cpu" and counts.is_pinned():
+        if (
+            counts.device.type == "cpu"
+            and counts.is_pinned()
+            and not _host_metadata_enabled()
+        ):
             device_counts = counts.detach().to(device=x.device, non_blocking=True)
         elif counts.device == x.device:
             device_counts = counts.detach()

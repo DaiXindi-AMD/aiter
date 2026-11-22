@@ -6,9 +6,12 @@ import pytest
 import torch
 from test_sonic_mxfp4 import decode
 
+from aiter.ops.triton.gemm.grouped import sonic_mxfp4 as sonic_gemm
 from aiter.ops.triton.gemm.grouped.sonic_mxfp4 import (
     pack_grouped_mxfp4_weights,
     prepare_expert_offsets,
+    prepare_grouped_gemm_metadata,
+    prepare_grouped_gemm_metadata_host,
 )
 from aiter.ops.triton.moe.sonic_mxfp4 import (
     RECIPES as EXPERT_RECIPES,
@@ -82,6 +85,80 @@ def test_device_counts_reject_invalid_contract():
     device_counts = torch.tensor(counts[:-1], dtype=torch.int64, device="cuda")
     with pytest.raises(ValueError, match="device_counts"):
         prepare_expert_offsets(counts, device_counts.device, device_counts)
+
+
+_REAL_ROUTE_COUNTS = (
+    1348, 860, 999, 1310, 870, 30, 881, 789, 598, 245, 0, 959, 2158, 471, 804, 0,
+    783, 936, 991, 100, 4, 1301, 716, 1612, 921, 456, 870, 782, 2958, 1661, 780, 1691,
+)  # fmt: skip
+
+
+@pytest.mark.parametrize(
+    "counts",
+    [(3, 0, 7, 5), (0, 0, 1), (129, 128, 127, 0, 256), _REAL_ROUTE_COUNTS],
+)
+@pytest.mark.parametrize("block_m,block_n", [(128, 128), (64, 128), (32, 256)])
+def test_host_metadata_matches_device_metadata(counts, block_m, block_n):
+    ns = (1536, 2048, 768, 100)
+    device = torch.device("cuda")
+    expected = prepare_grouped_gemm_metadata(counts, device, block_m, block_n)
+    actual = prepare_grouped_gemm_metadata_host(counts, device, block_m, block_n, ns)
+    for key in ("offsets", "counts_dev"):
+        assert actual[key].dtype == torch.int32 and actual[key].is_contiguous()
+        torch.testing.assert_close(actual[key], expected[key].int(), rtol=0, atol=0)
+    for n in ns:
+        expected_base = sonic_gemm._expert_block_base(expected, n)
+        actual_base = actual[("block_base", n)]
+        assert actual_base.dtype == torch.int32 and actual_base.is_contiguous()
+        torch.testing.assert_close(actual_base, expected_base, rtol=0, atol=0)
+    # A shape outside ``ns`` still falls back to the lazy device build.
+    torch.testing.assert_close(
+        sonic_gemm._expert_block_base(actual, 384),
+        sonic_gemm._expert_block_base(expected, 384),
+        rtol=0,
+        atol=0,
+    )
+
+
+@pytest.mark.parametrize("counts", [(), (3, -1), (2**31, 0)])
+def test_host_metadata_rejects_invalid_counts(counts):
+    with pytest.raises(ValueError):
+        prepare_grouped_gemm_metadata_host(
+            counts, torch.device("cuda"), 128, 128, (64,)
+        )
+
+
+@pytest.mark.parametrize("count_kind", ["tuple", "pinned"])
+def test_host_metadata_preserves_forward_and_backward(monkeypatch, count_kind):
+    counts = (3, 0, 7, 5)
+    torch.manual_seed(177)
+    inputs = torch.randn((15, 64), dtype=torch.bfloat16, device="cuda")
+    scores = torch.linspace(0, 1, 15, dtype=torch.float32, device="cuda")
+    w1 = torch.randn((4, 64, 64), dtype=torch.bfloat16, device="cuda") * 0.02
+    w2 = torch.randn((4, 32, 64), dtype=torch.bfloat16, device="cuda") * 0.02
+    dout = torch.randn_like(inputs)
+
+    def run(host_metadata):
+        monkeypatch.setenv("AITER_SONIC_HOST_METADATA", host_metadata)
+        args = tuple(
+            value.detach().clone().requires_grad_() for value in (inputs, w1, w2)
+        )
+        routed_scores = scores.detach().clone().requires_grad_()
+        count_arg = (
+            counts
+            if count_kind == "tuple"
+            else torch.tensor(counts, dtype=torch.int64, pin_memory=True)
+        )
+        output = moe_pre_routed_a4w4(
+            args[0], routed_scores, count_arg, args[1], args[2]
+        )
+        (output * dout).sum().backward()
+        return (output, args[0].grad, routed_scores.grad, args[1].grad, args[2].grad)
+
+    baseline = run("0")
+    candidate = run("1")
+    for actual, expected in zip(candidate, baseline):
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 def test_pinned_host_counts_preserve_forward_and_backward():
