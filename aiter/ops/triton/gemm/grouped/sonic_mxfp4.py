@@ -14,7 +14,6 @@ import functools
 import types
 
 import torch
-import triton
 
 from aiter.ops.triton._triton_kernels.moe.sonicmoe.grouped_gemm_triton import (
     _grouped_gemm_kernel,
@@ -63,9 +62,14 @@ def _resolve_cfg(family, m, n, k, e):
     return types.MappingProxyType(dict(cfg))
 
 
+def _cdiv(a, b):
+    """Host integer ceil-div; ``triton.cdiv`` is a ConstexprFunction costing ~0.6 us per call."""
+    return -(-a // b)
+
+
 def _m_bucket(m):
     """Coarse, stable M for config lookup (the config never depends on exact M)."""
-    return triton.next_power_of_2(max(int(m), 32))
+    return 1 << (max(int(m), 32) - 1).bit_length()
 
 
 def block_shape(family, m, n, k, e):
@@ -186,10 +190,10 @@ def prepare_grouped_gemm_metadata_host(counts, device, block_m, block_n, ns):
         offsets.append(offsets[-1] + c)
     values = offsets + list(counts)
     for n in ns:
-        tiles_n = triton.cdiv(n, block_n)
+        tiles_n = _cdiv(n, block_n)
         base = [0]
         for c in counts:
-            base.append(base[-1] + triton.cdiv(c, block_m) * tiles_n)
+            base.append(base[-1] + _cdiv(c, block_m) * tiles_n)
         values.extend(base)
     if max(values) >= 2**31:
         raise ValueError("grouped GEMM metadata exceeds int32")
@@ -218,7 +222,7 @@ def _expert_block_base(meta, n):
     block_n = meta["block_n"]
     blocks_per_expert = torch.div(
         meta["counts_dev"] + meta["block_m"] - 1, meta["block_m"], rounding_mode="floor"
-    ) * triton.cdiv(n, block_n)
+    ) * _cdiv(n, block_n)
     base = torch.cat(
         (
             torch.zeros(1, dtype=torch.int32, device=meta["counts_dev"].device),
@@ -371,7 +375,7 @@ def grouped_mxfp4_weight_gemm(
     offsets = metadata["offsets"]
     expert_block_base = _expert_block_base(metadata, n)
     block_map_iters = max(1, (e - 1).bit_length())
-    grid = sum(triton.cdiv(c, bm) * triton.cdiv(n, bn) for c in counts)
+    grid = sum(_cdiv(c, bm) for c in counts) * _cdiv(n, bn)
     _grouped_gemm_kernel[(grid,)](
         kernel_x,
         payload,

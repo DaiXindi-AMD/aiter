@@ -120,6 +120,16 @@ def test_host_metadata_matches_device_metadata(counts, block_m, block_n):
     )
 
 
+def test_host_integer_helpers_match_triton():
+    import triton
+
+    for a in range(0, 3000):
+        for b in (1, 16, 32, 64, 128, 256):
+            assert sonic_gemm._cdiv(a, b) == triton.cdiv(a, b)
+    for m in (0, 1, 31, 32, 33, 63, 64, 65, 1348, 2958, 4096, 4097, 2**20 + 1):
+        assert sonic_gemm._m_bucket(m) == triton.next_power_of_2(max(m, 32))
+
+
 @pytest.mark.parametrize("counts", [(), (3, -1), (2**31, 0)])
 def test_host_metadata_rejects_invalid_counts(counts):
     with pytest.raises(ValueError):
