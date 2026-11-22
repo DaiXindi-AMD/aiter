@@ -306,3 +306,40 @@ def test_general_routing_grouped_weights_match_legacy_layout(with_bias):
     if with_bias:
         torch.testing.assert_close(b1_grouped.grad, b1_legacy.grad)
         torch.testing.assert_close(b2_grouped.grad, b2_legacy.grad)
+
+
+_QWEN3_EP4_COUNTS = (
+    1348, 860, 999, 1310, 870, 30, 881, 789, 598, 245, 0, 959, 2158, 471, 804, 0,
+    783, 936, 991, 100, 4, 1301, 716, 1612, 921, 456, 870, 782, 2958, 1661, 780, 1691,
+)  # fmt: skip
+
+
+@pytest.mark.skipif(get_arch() != "gfx950", reason="gfx950 exact Wgrad configs")
+@pytest.mark.parametrize("k,n", [(2048, 1536), (768, 2048)])
+@pytest.mark.parametrize("accumulate", [False, True])
+def test_gfx950_exact_wgrad_config_matches_medium_bucket(monkeypatch, k, n, accumulate):
+    from aiter.ops.triton.moe import sonicmoe
+    from aiter.ops.triton.utils import sonicmoe_config_utils as cfg_utils
+
+    e = len(_QWEN3_EP4_COUNTS)
+    exact = cfg_utils.get_grouped_gemm_dw_config(n, k, e)
+    medium = cfg_utils._clean_bucket(
+        cfg_utils.load_sonicmoe_configs()["_grouped_gemm_dw_kernel"]["medium_NK"]
+    )
+    assert exact != medium
+    torch.manual_seed(k + n)
+    rows = sum(_QWEN3_EP4_COUNTS)
+    lhs = torch.randn((rows, k), dtype=torch.bfloat16, device="cuda")
+    rhs = torch.randn((rows, n), dtype=torch.bfloat16, device="cuda")
+    offsets = torch.tensor(
+        [0, *torch.tensor(_QWEN3_EP4_COUNTS).cumsum(0).tolist()],
+        dtype=torch.int32,
+        device="cuda",
+    )
+    start = torch.randn((e, k, n), dtype=torch.float32, device="cuda")
+    tuned = start.clone()
+    grouped_gemm(lhs, rhs, offsets, out=tuned, A_is_transposed=True, accumulate=accumulate)
+    monkeypatch.setattr(sonicmoe, "get_grouped_gemm_dw_config", lambda *a, **k: dict(medium))
+    reference = start.clone()
+    grouped_gemm(lhs, rhs, offsets, out=reference, A_is_transposed=True, accumulate=accumulate)
+    torch.testing.assert_close(tuned, reference, rtol=0, atol=0)

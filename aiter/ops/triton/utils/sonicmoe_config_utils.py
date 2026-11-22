@@ -98,6 +98,9 @@ def get_grouped_gemm_dw_config(
 ) -> dict[str, Any]:
     configs = load_sonicmoe_configs()
     section = configs["_grouped_gemm_dw_kernel"]
+    exact = section.get("_exact", {}).get(_specialized_key(N, K, E, has_gather))
+    if exact:
+        return _clean_bucket(exact)
     specialized = (
         section.get("_specialized", {}).get(_specialized_key(N, K, E, has_gather))
         if use_specialized
