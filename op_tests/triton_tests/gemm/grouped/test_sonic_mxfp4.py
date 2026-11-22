@@ -5,7 +5,10 @@
 import pytest
 import torch
 
-from aiter.ops.triton._triton_kernels.moe.sonicmoe.row_scale import row_scale_fp32
+from aiter.ops.triton._triton_kernels.moe.sonicmoe.row_scale import (
+    row_dot_fp32,
+    row_scale_fp32,
+)
 from aiter.ops.triton.gemm.grouped.sonic_mxfp4 import (
     block_shape,
     family_for,
@@ -149,6 +152,19 @@ def test_fused_row_scale_is_bit_identical(rows, n):
     out = torch.empty_like(x)
     assert row_scale_fp32(x, score, out) is out
     assert torch.equal(out, expected)
+
+
+@pytest.mark.parametrize("rows,n", [(28884, 2048), (1, 768), (33, 96), (5, 4100), (0, 128)])
+def test_row_dot_matches_fp32_eager_sum(rows, n):
+    torch.manual_seed(rows + n)
+    a = torch.randn((rows, n), device="cuda", dtype=torch.bfloat16)
+    b = torch.randn((rows, n), device="cuda", dtype=torch.bfloat16)
+    expected = (a.float() * b.float()).sum(dim=-1)
+    fused = row_dot_fp32(a, b)
+    assert fused.dtype == torch.float32 and fused.shape == (rows,)
+    # Same FP32 products; only the summation order differs from torch's reduction.
+    atol = 4e-6 * (a.float().abs() * b.float().abs()).sum(dim=-1).max().item() if rows else 0
+    torch.testing.assert_close(fused, expected, rtol=0, atol=atol)
 
 
 def test_all_empty_and_contract_rejection():

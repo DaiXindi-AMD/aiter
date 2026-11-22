@@ -285,8 +285,13 @@ def test_declared_surrogate_gradients_and_router(recipe):
         assert p.grad is not None and torch.isfinite(p.grad).all()
     with torch.no_grad():
         raw_y = operation(x, torch.ones_like(scores), counts, w1, w2)
+        products = dy.float() * raw_y.float()
+        # FP32 products and accumulation; the fused row dot sums in a different order.
         torch.testing.assert_close(
-            scores.grad, (dy.float() * raw_y.float()).sum(-1), rtol=0, atol=0
+            scores.grad,
+            products.sum(-1),
+            rtol=0,
+            atol=4e-6 * products.abs().sum(-1).max().item(),
         )
         wf1, wf2 = _decoded(w1.transpose(1, 2)), _decoded(w2.transpose(1, 2))
         wd1, wd2 = _decoded(w1), _decoded(w2)

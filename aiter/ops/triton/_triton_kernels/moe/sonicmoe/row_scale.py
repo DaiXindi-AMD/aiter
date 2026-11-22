@@ -14,9 +14,10 @@ import triton.language as tl
 
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
-__all__ = ["row_scale_fp32"]
+__all__ = ["row_dot_fp32", "row_scale_fp32"]
 
 _row_scale_repr = make_kernel_repr("_row_scale_kernel", ["BLOCK_N"])
+_row_dot_repr = make_kernel_repr("_row_dot_kernel", ["BLOCK_N"])
 
 
 @triton.jit(repr=_row_scale_repr)
@@ -41,6 +42,47 @@ def _row_scale_kernel(
         (value * score).to(out_ptr.dtype.element_ty),
         mask=mask,
     )
+
+
+@triton.jit(repr=_row_dot_repr)
+def _row_dot_kernel(
+    a_ptr,
+    b_ptr,
+    out_ptr,
+    N,
+    BLOCK_N: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    acc = tl.zeros((BLOCK_N,), dtype=tl.float32)
+    for start in range(0, N, BLOCK_N):
+        col = start + tl.arange(0, BLOCK_N)
+        mask = col < N
+        a = tl.load(a_ptr + row * N + col, mask=mask, other=0.0).to(tl.float32)
+        b = tl.load(b_ptr + row * N + col, mask=mask, other=0.0).to(tl.float32)
+        acc += a * b
+    tl.store(out_ptr + row, tl.sum(acc, axis=0))
+
+
+def row_dot_fp32(a, b, block_n=2048):
+    """Return ``(a.float() * b.float()).sum(-1)`` without FP32 temporaries.
+
+    Products and accumulation are FP32 as in the eager form; only the summation
+    order differs, so results agree to FP32 rounding rather than bit-for-bit.
+    """
+    if a.ndim != 2 or a.shape != b.shape:
+        raise ValueError("expected a[R,N] and b[R,N]")
+    if a.dtype not in (torch.bfloat16, torch.float16) or b.dtype != a.dtype:
+        raise ValueError("inputs must share a BF16 or FP16 dtype")
+    if b.device != a.device or not a.is_contiguous() or not b.is_contiguous():
+        raise ValueError("inputs must be contiguous on one device")
+    rows, n = a.shape
+    out = torch.empty((rows,), dtype=torch.float32, device=a.device)
+    if rows == 0:
+        return out
+    if n == 0:
+        return out.zero_()
+    _row_dot_kernel[(rows,)](a, b, out, n, BLOCK_N=block_n)
+    return out
 
 
 def row_scale_fp32(x, score, out=None, block_n=2048):

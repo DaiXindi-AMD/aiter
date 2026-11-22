@@ -11,7 +11,10 @@ import os
 
 import torch
 
-from aiter.ops.triton._triton_kernels.moe.sonicmoe.row_scale import row_scale_fp32
+from aiter.ops.triton._triton_kernels.moe.sonicmoe.row_scale import (
+    row_dot_fp32,
+    row_scale_fp32,
+)
 from aiter.ops.triton.gemm.grouped.bf16_wgrad import grouped_bf16_wgrad
 from aiter.ops.triton.gemm.grouped.mxfp4_wgrad import (
     MXFP4_WGRAD_BACKENDS,
@@ -298,7 +301,7 @@ class _PreRoutedMXFP4(torch.autograd.Function):
         bwd_format = RECIPES[ctx.recipe][1]
         counts, meta = ctx.counts, ctx.bwd_meta
         dout = dout.contiguous()
-        ds = (dout.float() * y.float()).sum(dim=-1)
+        ds = row_dot_fp32(dout, y)
         _w1_t, _w2_t, w1_p, w2_p = ctx.packed
         unweighted_da = grouped_mxfp4_weight_gemm(
             dout,
@@ -508,7 +511,7 @@ class _PreRoutedMappedMXFP4(torch.autograd.Function):
             _validate_main_grads(ctx.main_grads, (w1, w2))
         counts, meta = ctx.counts, ctx.bwd_meta
         dout = dout.contiguous()
-        ds = (dout.float() * y.float()).sum(dim=-1)
+        ds = row_dot_fp32(dout, y)
         _w1_t, _w2_t, w1_p, w2_p = ctx.packed
         unweighted_da = grouped_mxfp4_weight_gemm(
             dout,
