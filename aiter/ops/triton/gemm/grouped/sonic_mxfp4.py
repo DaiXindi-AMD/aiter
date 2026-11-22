@@ -18,6 +18,7 @@ import torch
 from aiter.ops.triton._triton_kernels.moe.sonicmoe.grouped_gemm_triton import (
     _grouped_gemm_kernel,
 )
+from aiter.ops.triton.quant.dual_mxfp4_weight_pack import quantize_mxfp4_weight_dual
 from aiter.ops.triton.quant.quant import dynamic_mxfp4_quant, dynamic_mxfp8_quant
 from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
 from aiter.ops.triton.utils.mxfp4_wgrad import (
@@ -31,6 +32,7 @@ __all__ = [
     "family_for",
     "grouped_mxfp4_weight_gemm",
     "pack_grouped_mxfp4_weights",
+    "pack_pre_routed_weights_dual",
     "prepare_expert_offsets",
     "prepare_grouped_gemm_metadata",
     "prepare_grouped_gemm_metadata_host",
@@ -97,6 +99,17 @@ def pack_grouped_mxfp4_weights(weight):
         payload.reshape(e, n, k // 2).contiguous(),
         scales.reshape(e, n, k // 32).contiguous(),
     )
+
+
+def pack_pre_routed_weights_dual(w1, w2):
+    """Same ordered packs as ``moe.sonic_mxfp4.pack_pre_routed_weights`` from one read each.
+
+    Returns (pack(w1.T), pack(w2.T), pack(w1), pack(w2)) byte-identically
+    without materializing the BF16 transposes.
+    """
+    w1_row, w1_col = quantize_mxfp4_weight_dual(w1)
+    w2_row, w2_col = quantize_mxfp4_weight_dual(w2)
+    return w1_col, w2_col, w1_row, w2_row
 
 
 def quantize_grouped_activation(x, activation_format):

@@ -1,0 +1,7 @@
+{
+  "BLOCK_SIZE_M": 32,
+  "BLOCK_SIZE_N": 128,
+  "USE_ASM": true,
+  "num_warps": 4,
+  "num_stages": 1
+}
