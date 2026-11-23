@@ -863,7 +863,9 @@ class _FlashAttnFunc(torch.autograd.Function):
         q, k, v, out, softmax_lse, sink = ctx.saved_tensors
         bias = ctx.bias
         dbias = torch.empty_like(bias) if bias is not None else None
-        dq, dk, dv = torch.zeros_like(q), torch.empty_like(k), torch.empty_like(v)
+        # The fused kernel accumulates dK/dV atomically over each GQA group.
+        alloc_dkdv = torch.zeros_like if _USE_FUSED_BWD_KERNEL else torch.empty_like
+        dq, dk, dv = torch.zeros_like(q), alloc_dkdv(k), alloc_dkdv(v)
         dsink = (
             torch.zeros_like(sink, dtype=torch.float32) if sink is not None else None
         )
@@ -1193,7 +1195,9 @@ class _FlashAttnVarlenFunc(torch.autograd.Function):
     @staticmethod
     def backward(ctx, do, *args):
         q, k, v, out, softmax_lse, cu_seqlens_q, cu_seqlens_k, sink = ctx.saved_tensors
-        dq, dk, dv = torch.zeros_like(q), torch.empty_like(k), torch.empty_like(v)
+        # The fused kernel accumulates dK/dV atomically over each GQA group.
+        alloc_dkdv = torch.zeros_like if _USE_FUSED_BWD_KERNEL else torch.empty_like
+        dq, dk, dv = torch.zeros_like(q), alloc_dkdv(k), alloc_dkdv(v)
         bias = ctx.bias
         dbias = torch.empty_like(bias) if bias is not None else None
         dsink = (

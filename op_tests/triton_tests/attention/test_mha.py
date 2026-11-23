@@ -865,6 +865,55 @@ def test_mha_backward_sbhd_do(
         torch.testing.assert_close(tri, ref.to(tri.dtype), atol=atol, rtol=rtol)
 
 
+@pytest.mark.parametrize("SEQLEN", [1024, 4096])
+@pytest.mark.parametrize("NUM_Q_HEADS, NUM_K_HEADS", [(32, 4), (32, 32)])
+@pytest.mark.parametrize("CAUSAL", [True, False])
+def test_mha_fused_backward_reused_grad_memory(
+    SEQLEN: int,
+    NUM_Q_HEADS: int,
+    NUM_K_HEADS: int,
+    CAUSAL: bool,
+    dtype=torch.bfloat16,
+):
+    """dK/dV of the fused backward must not depend on what the allocator hands back.
+
+    The fused kernel accumulates dK/dV with atomics, so their buffers have to start at
+    zero. The caching allocator is filled with NaN blocks of the gradient shapes right
+    before the backward so a stale buffer would show up.
+    """
+    HEAD_SZ = 128
+    torch.cuda.empty_cache()
+    torch.manual_seed(20)
+    q = torch.randn(1, SEQLEN, NUM_Q_HEADS, HEAD_SZ, device="cuda", dtype=dtype)
+    k = torch.randn(1, SEQLEN, NUM_K_HEADS, HEAD_SZ, device="cuda", dtype=dtype)
+    v = torch.randn(1, SEQLEN, NUM_K_HEADS, HEAD_SZ, device="cuda", dtype=dtype)
+    q.requires_grad = True
+    k.requires_grad = True
+    v.requires_grad = True
+    do = torch.randn_like(q)
+
+    mha_set_use_fused_bwd_kernel(True)
+    try:
+        with torch.enable_grad():
+            triton_out = flash_attn_func(q, k, v, causal=CAUSAL)
+        stale = [torch.full_like(t, float("nan")) for t in (q, k, v, k, v)]
+        del stale
+        triton_dq, triton_dk, triton_dv = torch.autograd.grad(
+            triton_out, (q, k, v), do.clone()
+        )
+    finally:
+        mha_set_use_fused_bwd_kernel(False)
+
+    torch_out, torch_grads, fwd_tol, bwd_tols = attention_ref_with_tol(
+        q, k, v, do, causal=CAUSAL
+    )
+    triton_vals = [triton_out, triton_dq, triton_dk, triton_dv]
+    ref_vals = [torch_out, *torch_grads]
+    tols = [fwd_tol] + bwd_tols
+    for tri, ref, (atol, rtol) in zip(triton_vals, ref_vals, tols):
+        torch.testing.assert_close(tri, ref.to(tri.dtype), atol=atol, rtol=rtol)
+
+
 @pytest.mark.parametrize("SEQLEN_Q", [512, 2048])
 @pytest.mark.parametrize("SEQLEN_K", [512, 2048])
 @pytest.mark.parametrize("NUM_Q_HEADS", [32, 64])
