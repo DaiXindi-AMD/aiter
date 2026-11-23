@@ -77,9 +77,9 @@
         "BLOCK_M": 32,
         "BLOCK_N": 128,
         "num_warps": 4,
-        "num_stages": 1,
+        "num_stages": 2,
         "waves_per_eu": 1,
-        "BLK_SLICE_FACTOR": 1,
+        "BLK_SLICE_FACTOR": 2,
         "matrix_instr_nonkdim": 16
     }
   },
