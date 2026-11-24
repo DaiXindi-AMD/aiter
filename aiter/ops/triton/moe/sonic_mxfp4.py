@@ -47,6 +47,7 @@ __all__ = [
     "MAPPED_DUAL_QUANT_API_VERSION",
     "MXFP4_WGRAD_API_VERSION",
     "MXFP4_WGRAD_BACKENDS",
+    "PRE_ROUTED_MXFP4_WGRAD_BACKENDS",
     "RECIPES",
     "moe_pre_routed_a4w4",
     "moe_pre_routed_a8w4",
@@ -59,6 +60,8 @@ __all__ = [
 BF16_WGRAD_MAIN_GRAD_API_VERSION = 1
 MAPPED_DUAL_QUANT_API_VERSION = 1
 MXFP4_WGRAD_API_VERSION = 1
+# "opus" runs the whole a4w4 expert chain fused (see sonic_mxfp4_opus).
+PRE_ROUTED_MXFP4_WGRAD_BACKENDS = (*MXFP4_WGRAD_BACKENDS, "opus")
 
 RECIPES = {
     "w4a16": ("bf16", "bf16"),
@@ -599,8 +602,10 @@ def _pre_routed_mxfp4(
     """
     if recipe not in RECIPES:
         raise ValueError("invalid recipe")
-    if wgrad_backend not in MXFP4_WGRAD_BACKENDS:
-        raise ValueError("wgrad_backend must be triton or gluon")
+    if wgrad_backend not in PRE_ROUTED_MXFP4_WGRAD_BACKENDS:
+        raise ValueError("wgrad_backend must be triton, gluon or opus")
+    if wgrad_backend == "opus" and wgrad_mode != "mxfp4":
+        raise ValueError("wgrad_backend=opus requires wgrad_mode=mxfp4")
     if wgrad_mode not in ("bf16", "mxfp4") or (
         wgrad_mode == "mxfp4" and recipe != "a4w4"
     ):
@@ -646,6 +651,18 @@ def _pre_routed_mxfp4(
     counts = tuple(counts)
     if any(type(c) is not int or c < 0 for c in counts) or sum(counts) != x.shape[0]:
         raise ValueError("counts must be nonnegative and sum to R")
+    if wgrad_backend == "opus":
+        from aiter.ops.triton.moe.sonic_mxfp4_opus import (
+            _PreRoutedMXFP4Opus,
+            opus_wgrad_unsupported_reason,
+        )
+
+        reason = opus_wgrad_unsupported_reason(x.device, e, h, j // 2, max(counts))
+        if reason is not None:
+            raise NotImplementedError(reason)
+        if main_grads is not None:
+            _validate_main_grads(main_grads, (w1, w2))
+        return _PreRoutedMXFP4Opus.apply(x, scores, w1, w2, counts, packed, main_grads)
     if wgrad_mode == "mxfp4":
         cfg1, _ = check_mxfp4_wgrad_support(
             x.device, j, h, backend=wgrad_backend, transpose_output=True
@@ -691,7 +708,10 @@ def moe_pre_routed_a4w4(
     main_grads=None,
     wgrad_backend="triton",
 ):
-    """A4W4 F/D; optional native Wgrad adds into two FP32 weight-shaped buffers."""
+    """A4W4 F/D; optional native Wgrad adds into two FP32 weight-shaped buffers.
+
+    ``wgrad_backend="opus"`` (gfx950) runs the same recipe on the fused HIP/OPUS chain.
+    """
     return _pre_routed_mxfp4(
         x,
         scores,

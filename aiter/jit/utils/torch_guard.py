@@ -81,6 +81,9 @@ NONE_WRAPPED_OP = [
     "qr_destroy",
     "qr_open_handles",
     "qr_get_handle",
+    # Raw device addresses on the eager MXFP4 MoE autograd path, called per layer.
+    "_mxfp4_moe_fused_quant",
+    "_opus_mxfp4_wgrad",
     # These take pybind aiter_tensor_t, not torch.Tensor -- incompatible with torch.compile
     "all_reduce",
     "reduce_scatter",

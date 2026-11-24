@@ -185,6 +185,7 @@ _fwd_repr = make_kernel_repr(
         "A4_ACTIVATION",
         "A8_ACTIVATION",
         "CACHE_MODIFIER",
+        "ROW_SCALE",
         "num_warps",
         "num_stages",
     ],
@@ -227,6 +228,9 @@ def _grouped_gemm_kernel(
     A8_ACTIVATION: tl.constexpr = False,
     expert_block_base_ptr=None,
     BLOCK_MAP_ITERS: tl.constexpr = 0,
+    row_scale_ptr=None,
+    scaled_C_ptr=None,
+    ROW_SCALE: tl.constexpr = False,
 ):
     # Exactly one activation format: BF16 (A16W4), E2M1 (A4W4) or E4M3 (A8W4).
     tl.static_assert(not (A4_ACTIVATION and A8_ACTIVATION))
@@ -421,6 +425,17 @@ def _grouped_gemm_kernel(
     )
     c_mask = m_mask[:, None] & (offs_n[None, :] < N)
     tl.store(c_ptrs, c, mask=c_mask)
+
+    if ROW_SCALE:
+        # Also store bf16(c * row_scale[row]) in FP32, the same rounding as row_scale_fp32.
+        scale = tl.load(row_scale_ptr + c_row_idx, mask=m_mask, other=0.0)
+        tl.store(
+            scaled_C_ptr
+            + c_row_idx[:, None] * stride_cm
+            + offs_n[None, :].to(tl.int64) * stride_cn,
+            (c.to(tl.float32) * scale[:, None]).to(scaled_C_ptr.dtype.element_ty),
+            mask=c_mask,
+        )
 
 
 _grouped_gemm_kernel_autotuned = triton.autotune(
